@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-VERSION="4.0"
+VERSION="4.1"
 NAME="RatBurrow"
 
 set -u
@@ -969,13 +969,15 @@ menu() {
   echo "  ${B}1${R}. Подготовить сервер"
   echo "  ${B}2${R}. Настроить защищенный канал RELAY ← BACKEND"
   [ $has -eq 1 ] && echo "  ${B}3${R}. Откат"
+  [ $has -eq 1 ] && echo "  ${B}4${R}. Обновить: сторож моста и keepalive (без переустановки)"
   while true; do
     rd -r -p "${B}?${R} Выберите вариант: " c
     case "$c" in
       1) MODE="prepare"; return 0 ;;
       2) MODE="install"; return 0 ;;
       3) if [ $has -eq 1 ]; then MODE="uninstall"; return 0; fi; fail "вариант 3 доступен только после установки" ;;
-      *) if [ $has -eq 1 ]; then fail "введите от 1 до 3"; else fail "введите от 1 до 2"; fi ;;
+      4) if [ $has -eq 1 ]; then MODE="upgrade"; return 0; fi; fail "вариант 4 доступен только после установки" ;;
+      *) if [ $has -eq 1 ]; then fail "введите от 1 до 4"; else fail "введите от 1 до 2"; fi ;;
     esac
   done
 }
@@ -3330,7 +3332,7 @@ open("/etc/nginx/snippets/chain-headers.conf", "w").write(
     'add_header X-Request-ID $request_id always;\n')
 open("/etc/nginx/conf.d/chain-limit.conf", "w").write(
     "limit_req_zone $binary_remote_addr zone=chain_site:10m rate=10r/s;\nlimit_req_status 429;\n"
-    "# окно приёма HTTP/2 на поток (по умолчанию 64k): скорость одного потока = окно / RTT, при 60 мс это около 1 МБ/с\n"
+    "# окно приёма HTTP/2 на поток (по умолчанию 64k): скорость одного потока ≈ окно / RTT: при 60 мс 64k даёт около 1 МБ/с, 4m около 65 МБ/с (замер на стенде)\n"
     "http2_body_preread_size 4m;\n"
     "keepalive_requests 100000;\n")
 if not os.path.exists("/etc/nginx/chain-backend.conf"):
@@ -3410,7 +3412,9 @@ server {
         error_page 403 =404 /404.html;
         default_type text/plain;
         add_header Cache-Control "no-store" always;
-        alias /var/lib/chain/xray-version;
+        # root+try_files: alias на файл без «/» давал 500 из-за обработчика index (…xray-versionindex.html)
+        root /var/lib/chain;
+        try_files /xray-version =404;
     }
 
     # Панель 3x-ui по отдельному пути
@@ -3742,7 +3746,9 @@ cfg = {
          "settings": {"address": relay, "port": 443, "id": tuuid, "encryption": "none", "reverse": {"tag": "r-in"}},
          "streamSettings": {"network": "xhttp", "security": "tls",
                             "tlsSettings": {"serverName": domain, "fingerprint": "chrome", "alpn": ["h2"]},
-                            "xhttpSettings": {"host": domain, "path": "/" + tpath + "/", "mode": "stream-up", "xPaddingBytes": "100-1000"}}},
+                            "xhttpSettings": {"host": domain, "path": "/" + tpath + "/", "mode": "stream-up", "xPaddingBytes": "100-1000",
+                                            # keepalive HTTP/2 (PING раз в ~15 с): без него молча умершее соединение мост замечает только через минуты
+                                            "xmux": {"hKeepAlivePeriod": 15}}}},
         # ВАЖНО: без явных finalRules Xray блокирует весь трафик reverse-моста (vless-reverse) на 30–90 с.
         # geoip:private не используем — ему нужен geoip.dat, а на BACKEND ставится только бинарник xray.
         {"tag": "direct", "protocol": "freedom",
@@ -3884,6 +3890,276 @@ sleep 3
 systemctl is-active --quiet chain-bridge
 EOF
 
+  # RELAY: состояние туннеля для сторожа BACKEND (chain-health, таймер 30 с) и путь /health в nginx; чинит и путь версии Xray
+  cat > "$D/health-relay.sh" <<'EOF'
+set -Eeuo pipefail
+VPATH="${1:?не передан секретный путь версии}"
+F=/etc/nginx/sites-available/xpn.conf
+[ -f "$F" ] || { echo "нет $F: сначала настройте канал" >&2; exit 1; }
+mkdir -p /var/lib/chain
+cat > /usr/local/bin/chain-health <<'EOT_H'
+#!/bin/bash
+# chain-health — состояние туннеля для сторожа на BACKEND (запускается таймером chain-health.timer раз в 30 с).
+# Пишет /var/lib/chain/health: число соединений моста и результат сквозной проверки
+# (клиент → nginx → туннель → BACKEND → интернет, не чаще раза в 2 мин и только при подключённом мосте).
+# Файл по секретному пути отдаёт nginx только с IP BACKEND.
+#   chain-health          обновить файл состояния
+#   chain-health --show   показать состояние (его выводит и chain-status)
+H=${CHAIN_HEALTH_FILE:-/var/lib/chain/health}
+conf=${CHAIN_SETUP_CONF:-/root/.chain-setup.conf}
+now=${CHAIN_HEALTH_NOW:-$(date +%s)}
+get() { sed -n "s/^$1=//p" "$conf" 2>/dev/null | head -n1; }
+kv() { sed -n "s/^$1=//p" "$H" 2>/dev/null | head -n1; }
+if [ "${1:-}" = "--show" ]; then
+  if [ ! -r "$H" ]; then echo "сторож:       данных нет (chain-health ещё не запускался)"; exit 0; fi
+  ts=$(kv ts); c=$(kv conns); e=$(kv e2e); et=$(kv e2e_ts)
+  echo "сторож:       проверено $((now - ${ts:-0})) с назад; соединений моста: ${c:-?}; сквозная проверка: ${e:-?} ($((now - ${et:-0})) с назад)"
+  exit 0
+fi
+mkdir -p "$(dirname "$H")"
+exec 9>"${CHAIN_HEALTH_LOCK:-/run/chain-health.lock}"; flock -n 9 || exit 0
+
+# сквозная проверка: 0 — прошла, 1 — не прошла, 2 — нет условий (nginx/3x-ui не работают, нет данных)
+e2e_probe() {
+  local D xray tmp pid port=21483 code ip
+  D=$(get DOMAIN)
+  xray=$(ls /usr/local/x-ui/bin/xray-linux-* 2>/dev/null | head -n1)
+  [ -n "$D" ] && [ -x "$xray" ] || return 2
+  systemctl is-active --quiet nginx && systemctl is-active --quiet x-ui || return 2
+  ss -tlnH "( sport = :21443 )" 2>/dev/null | grep -q . || return 2
+  tmp=$(mktemp -d)
+  python3 - "$D" "$tmp/c.json" "$port" <<'PY' || { rm -rf "$tmp"; return 2; }
+import json, sqlite3, sys
+domain, out, port = sys.argv[1:4]
+db = sqlite3.connect("/etc/x-ui/x-ui.db")
+st, se = db.execute("select stream_settings, settings from inbounds where port = 21443 limit 1").fetchone()
+xh = json.loads(st)["xhttpSettings"]
+uid = json.loads(se)["clients"][0]["id"]
+json.dump({"log": {"loglevel": "none"},
+           "inbounds": [{"listen": "127.0.0.1", "port": int(port), "protocol": "socks", "settings": {"udp": False}}],
+           "outbounds": [{"protocol": "vless", "settings": {"address": "127.0.0.1", "port": 443, "id": uid, "encryption": "none"},
+                          "streamSettings": {"network": "xhttp", "security": "tls",
+                                             "tlsSettings": {"serverName": domain, "fingerprint": "chrome", "alpn": ["h2"]},
+                                             "xhttpSettings": xh}}]}, open(out, "w"))
+PY
+  "$xray" run -c "$tmp/c.json" >/dev/null 2>&1 </dev/null &
+  pid=$!
+  sleep 2
+  code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 12 -x "socks5h://127.0.0.1:$port" https://www.google.com/generate_204 2>/dev/null)
+  ip=""
+  [ "$code" = 204 ] || ip=$(curl -4 -s --max-time 12 -x "socks5h://127.0.0.1:$port" https://api.ipify.org 2>/dev/null | tr -d '[:space:]')
+  kill "$pid" 2>/dev/null; wait "$pid" 2>/dev/null; rm -rf "$tmp"
+  [ "$code" = 204 ] || [[ "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]
+}
+
+conns=$(ss -tnH state established "( sport = :21444 )" 2>/dev/null | wc -l)
+e2e=$(kv e2e); e2e_ts=$(kv e2e_ts); e2e=${e2e:-unknown}; e2e_ts=${e2e_ts:-0}
+[[ "$e2e_ts" =~ ^[0-9]+$ ]] || e2e_ts=0
+if [ "$conns" -ge 1 ] && [ $((now - e2e_ts)) -ge 120 ]; then
+  e2e_probe; rc=$?
+  case $rc in 0) e2e=ok ;; 1) e2e=fail ;; *) e2e=unknown ;; esac
+  e2e_ts=$now
+fi
+printf 'ts=%s\nconns=%s\ne2e=%s\ne2e_ts=%s\n' "$now" "$conns" "$e2e" "$e2e_ts" > "$H.tmp" && mv -f "$H.tmp" "$H"
+chmod 644 "$H"
+EOT_H
+chmod +x /usr/local/bin/chain-health
+cat > /etc/systemd/system/chain-health.service <<'EOT_S'
+[Unit]
+Description=chain health (состояние туннеля для сторожа BACKEND)
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/chain-health
+EOT_S
+cat > /etc/systemd/system/chain-health.timer <<'EOT_T'
+[Unit]
+Description=chain health: раз в 30 секунд
+
+[Timer]
+OnBootSec=60
+OnUnitActiveSec=30
+AccuracySec=5
+
+[Install]
+WantedBy=timers.target
+EOT_T
+cp -p "$F" "$F.bak-health"
+if ! python3 - "$F" "$VPATH" <<'PY'
+# Обновляет конфиг nginx RELAY: (1) путь версии Xray отдаёт файл через root+try_files (alias на файл без «/» давал 500
+# из-за обработчика index); (2) добавляет путь состояния туннеля для сторожа BACKEND (только с IP BACKEND).
+# Идемпотентно. Код возврата: 0 — готово, 2 — не найден блок версии Xray.
+import re, sys
+f, vp = sys.argv[1], sys.argv[2]
+s = open(f).read()
+pat = r"    location = /%s/ \{.*?\n    \}\n" % re.escape(vp)
+m = re.search(pat, s, re.S)
+if not m:
+    print("блок версии Xray не найден в %s" % f)
+    sys.exit(2)
+ver = m.group(0)
+fixed = ver.replace("        alias /var/lib/chain/xray-version;\n", "        root /var/lib/chain;\n        try_files /xray-version =404;\n")
+out = s[:m.start()] + fixed + s[m.end():]
+done = []
+if fixed != ver:
+    done.append("путь версии исправлен")
+if "location = /%s/health {" % vp not in out:
+    m = re.search(pat, out, re.S)
+    block = ("\n    # Состояние туннеля для сторожа моста BACKEND (доступно только с IP BACKEND)\n"
+             "    location = /%s/health {\n"
+             "        include /etc/nginx/chain-backend.conf;\n"
+             "        error_page 403 =404 /404.html;\n"
+             "        default_type text/plain;\n"
+             "        add_header Cache-Control \"no-store\" always;\n"
+             "        alias /var/lib/chain/health;\n"
+             "    }\n") % vp
+    out = out[:m.end()] + block + out[m.end():]
+    done.append("добавлен путь состояния")
+if out != s:
+    open(f, "w").write(out)
+print(", ".join(done) or "уже актуально")
+PY
+then
+  cp -p "$F.bak-health" "$F"; echo "конфиг nginx не изменён" >&2; exit 1
+fi
+if nginx -t >/dev/null 2>&1; then
+  systemctl reload nginx
+  rm -f "$F.bak-health"
+else
+  cp -p "$F.bak-health" "$F"; nginx -t >&2 || true; echo "nginx -t не прошёл, конфиг возвращён" >&2; exit 1
+fi
+if [ -f /usr/local/bin/chain-status ] && ! grep -q 'chain-health --show' /usr/local/bin/chain-status; then
+  printf '%s\n' '[ -x /usr/local/bin/chain-health ] && /usr/local/bin/chain-health --show' >> /usr/local/bin/chain-status
+fi
+systemctl daemon-reload
+systemctl enable --now chain-health.timer >/dev/null 2>&1
+/usr/local/bin/chain-health || true
+EOF
+
+  # BACKEND: keepalive HTTP/2 для моста и сторож chain-watchdog (таймер 20 с); идемпотентно, подходит и для уже установленного моста
+  cat > "$D/watchdog-install.sh" <<'EOF'
+set -Eeuo pipefail
+CF=/etc/chain-bridge/config.json
+[ -f "$CF" ] && [ -f /etc/chain-bridge/sync.conf ] && [ -x /usr/local/bin/chain-xray ] || { echo "мост chain-bridge не установлен" >&2; exit 1; }
+NEW="${CF%.json}.next.json"   # Xray определяет формат по расширению: временный файл тоже *.json
+changed=$(python3 - "$CF" "$NEW" <<'PY'
+import json, sys
+f = sys.argv[1]
+c = json.load(open(f))
+xm = c["outbounds"][0]["streamSettings"]["xhttpSettings"].setdefault("xmux", {})
+if "hKeepAlivePeriod" in xm:
+    print(0)
+else:
+    xm["hKeepAlivePeriod"] = 15
+    json.dump(c, open(sys.argv[2], "w"), indent=2)
+    print(1)
+PY
+)
+if [ "$changed" = 1 ]; then
+  chown --reference="$CF" "$NEW"; chmod --reference="$CF" "$NEW"
+  if /usr/local/bin/chain-xray run -test -c "$NEW" >/dev/null 2>&1; then mv -f "$NEW" "$CF"; else rm -f "$NEW"; echo "конфиг моста с keepalive не прошёл проверку Xray" >&2; exit 1; fi
+fi
+mkdir -p /var/lib/chain-bridge/watchdog
+cat > /usr/local/bin/chain-watchdog <<'EOT_WD'
+#!/bin/bash
+# chain-watchdog — сторож моста (BACKEND). Раз в 20 с читает у RELAY состояние туннеля (его пишет chain-health).
+# Перезапускает chain-bridge, только если RELAY доступен, но не видит мост (3 проверки подряд, около 1 мин)
+# или сквозная проверка на RELAY провалилась 2 раза подряд (около 4 мин). Недоступность RELAY и устаревшее
+# состояние — не повод: перезапуск моста тут не поможет. Не чаще раза в 3 мин и не больше 4 раз в час.
+#   chain-watchdog            одна проверка (запускается таймером)
+#   chain-watchdog --status   последнее решение и история перезапусков
+CONF=${CHAIN_BRIDGE_CONF:-/etc/chain-bridge/sync.conf}
+S=${CHAIN_WD_STATE:-/var/lib/chain-bridge/watchdog}
+now=${CHAIN_WD_NOW:-$(date +%s)}
+get() { sed -n "s/^$1=//p" "$CONF" 2>/dev/null | head -n1; }
+sv() { sed -n "s/^$1=//p" "$S/state" 2>/dev/null | head -n1; }
+num() { [[ "${1:-}" =~ ^[0-9]+$ ]]; }
+mkdir -p "$S"
+if [ "${1:-}" = "--status" ]; then
+  if [ -r "$S/state" ]; then cat "$S/state"; else echo "состояния ещё нет"; fi
+  echo "перезапусков за последний час: $(awk -v n="$now" '$1 > n - 3600' "$S/restarts" 2>/dev/null | wc -l)"
+  echo "последние перезапуски:"; tail -n 5 "$S/restarts" 2>/dev/null | while read -r t why; do echo "  $(date -d "@$t" '+%F %T') $why"; done
+  exit 0
+fi
+RELAY_IP=$(get RELAY_IP); DOMAIN=$(get DOMAIN); VPATH=$(get VPATH)
+[ -n "$RELAY_IP" ] && [ -n "$DOMAIN" ] && [ -n "$VPATH" ] || exit 0
+systemctl is-active --quiet chain-bridge || exit 0     # мост остановлен вручную — не вмешиваемся
+
+verdict=ok; reason=""
+cf=$(sv conn_fails); ef=$(sv e2e_fails); seen=$(sv e2e_seen); grace=$(sv grace_until)
+num "$cf" || cf=0; num "$ef" || ef=0; num "$seen" || seen=0; num "$grace" || grace=0
+body=$(curl -fsS --max-time 8 --resolve "$DOMAIN:443:$RELAY_IP" "https://$DOMAIN/$VPATH/health" 2>/dev/null) || body=""
+g() { printf '%s\n' "$body" | sed -n "s/^$1=//p" | head -n1; }
+ts=$(g ts); conns=$(g conns); e2e=$(g e2e); e2et=$(g e2e_ts)
+if [ -z "$body" ]; then
+  verdict=relay-unreachable
+elif ! num "$ts" || ! num "$conns"; then
+  verdict=bad-response
+elif [ $((now - ts)) -gt 180 ]; then
+  verdict=health-stale
+elif [ "$now" -lt "$grace" ]; then
+  verdict=grace      # после перезапуска моста даём время подключиться
+else
+  if [ "$conns" -lt 1 ]; then cf=$((cf + 1)); reason="RELAY не видит мост ($cf)"; else cf=0; fi
+  if num "$e2et" && [ $((now - e2et)) -le 300 ] && [ "$e2et" != "$seen" ]; then
+    seen=$e2et
+    case "$e2e" in
+      fail) ef=$((ef + 1)); reason="${reason:+$reason; }сквозная проверка не прошла ($ef)" ;;
+      ok) ef=0 ;;
+    esac
+  fi
+  [ "$cf" -eq 0 ] && [ "$ef" -eq 0 ] || verdict=failing
+fi
+if [ "$verdict" = failing ] && { [ "$cf" -ge 3 ] || [ "$ef" -ge 2 ]; }; then
+  last=$(tail -n 1 "$S/restarts" 2>/dev/null | awk '{print $1}'); num "$last" || last=0
+  recent=$(awk -v n="$now" '$1 > n - 3600' "$S/restarts" 2>/dev/null | wc -l)
+  if [ $((now - last)) -lt 180 ]; then
+    verdict=cooldown
+  elif [ "$recent" -ge 4 ]; then
+    verdict=rate-limited; logger -t chain-watchdog "мост не восстанавливается: уже $recent перезапусков за час, жду"
+  else
+    logger -t chain-watchdog "перезапуск chain-bridge: $reason"
+    echo "$now $reason" >> "$S/restarts"; tail -n 50 "$S/restarts" > "$S/restarts.tmp" && mv -f "$S/restarts.tmp" "$S/restarts"
+    systemctl restart chain-bridge
+    cf=0; ef=0; grace=$((now + 90)); verdict=restarted
+  fi
+fi
+prev=$(sv verdict)
+[ "$verdict" = "$prev" ] || [ "$verdict" = ok ] || logger -t chain-watchdog "состояние: $verdict${reason:+ ($reason)}"
+{ echo "verdict=$verdict"; echo "checked=$now"; echo "relay_conns=${conns:-?}"; echo "e2e=${e2e:-?}"
+  echo "conn_fails=$cf"; echo "e2e_fails=$ef"; echo "e2e_seen=$seen"; echo "grace_until=$grace"; } > "$S/state.tmp" && mv -f "$S/state.tmp" "$S/state"
+exit 0
+EOT_WD
+chmod +x /usr/local/bin/chain-watchdog
+cat > /etc/systemd/system/chain-watchdog.service <<'EOT_S'
+[Unit]
+Description=chain watchdog (сторож моста)
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/chain-watchdog
+EOT_S
+cat > /etc/systemd/system/chain-watchdog.timer <<'EOT_T'
+[Unit]
+Description=chain watchdog: раз в 20 секунд
+
+[Timer]
+OnBootSec=120
+OnUnitActiveSec=20
+AccuracySec=2
+
+[Install]
+WantedBy=timers.target
+EOT_T
+systemctl daemon-reload
+systemctl enable --now chain-watchdog.timer >/dev/null 2>&1
+if [ "$changed" = 1 ]; then
+  systemctl restart chain-bridge
+  sleep 3
+  systemctl is-active --quiet chain-bridge
+fi
+EOF
+
   # BACKEND: firewall — только SSH (все остальные входящие закрыты)
   cat > "$D/ufw-backend.sh" <<'EOF'
 set -e
@@ -3905,7 +4181,9 @@ EOF
 
   # BACKEND: откат моста
   cat > "$D/uninstall-backend.sh" <<'EOF'
-systemctl disable --now chain-bridge chain-update-bridge.timer >/dev/null 2>&1 || true
+systemctl disable --now chain-watchdog.timer chain-bridge chain-update-bridge.timer >/dev/null 2>&1 || true
+rm -f /etc/systemd/system/chain-watchdog.service /etc/systemd/system/chain-watchdog.timer /usr/local/bin/chain-watchdog
+rm -rf /var/lib/chain-bridge
 rm -f /etc/systemd/system/chain-bridge.service /usr/local/bin/chain-xray /usr/local/bin/chain-xray.prev /usr/local/bin/chain-set-relay \
   /etc/systemd/system/chain-update-bridge.service /etc/systemd/system/chain-update-bridge.timer /usr/local/bin/chain-update-bridge /run/chain-update.lock
 rm -rf /etc/chain-bridge
@@ -4216,10 +4494,12 @@ run_install() {
   step_run "nginx: сертификат, секретные пути, «живые» эндпоинты, автопродление (панель: $([ $HIDE_PANEL -eq 1 ] && echo скрыта || echo опубликована))" python3 "$TMPD/nginx-final.py" "$DOMAIN" "$xw" "$USER_PATH" "$TUNNEL_PATH" "$CHAIN_USER_PORT" "$CHAIN_TUNNEL_PORT" "$BACKEND_IP" "$HIDE_PANEL" "$VER_PATH" || die "не удалось включить финальный конфиг nginx"
   /usr/local/bin/sync-sub-path >>"$LOG" 2>&1 || true
   step_run "Перезапуск 3x-ui (применение маршрутизации)" bash -c 'systemctl restart x-ui && sleep 4 && systemctl is-active --quiet x-ui' || warn "x-ui не перезапустился"
+  step_run "chain-health (состояние туннеля для сторожа) и путь /health в nginx" lscript "$TMPD/health-relay.sh" "$VER_PATH" || warn "chain-health установлен не полностью (см. лог)"
 
   # [10] мост на BACKEND
   section "BACKEND: мост Xray"
   step_run "Установка Xray (проверка SHA-256) и запуск chain-bridge" backend_bridge || die "мост не запустился (journalctl -u chain-bridge на BACKEND)"
+  step_run "Сторож моста (chain-watchdog, раз в 20 с) и keepalive HTTP/2" rscript "$TMPD/watchdog-install.sh" || warn "сторож моста установлен не полностью (см. лог)"
 
   # [11] проверка цепочки
   section "Проверка цепочки"
@@ -4312,9 +4592,11 @@ run_install() {
   echo "     chain-site-refresh           обновить страницы «живого» сайта (то же делает таймер раз в 5 минут)"
   echo "     sync-sub-path                прописать пути подписки из 3x-ui в nginx (таймер; вручную — после смены путей в панели)"
   echo "     chain-xray-version           записать версию Xray релея (срабатывает сама при обновлении ядра панели)"
+  echo "     chain-health --show          состояние туннеля, которое видит сторож BACKEND (обновляется раз в 30 с)"
   echo "   BACKEND:"
   echo "     chain-set-relay IP           указать новый IP RELAY и перезапустить мост"
   echo "     chain-update-bridge [ВЕРСИЯ|--status]   привести Xray моста к версии RELAY или к указанной; --status — показать версии (только вручную)"
+  echo "     chain-watchdog --status      решение сторожа и история перезапусков моста (сторож проверяет раз в 20 с)"
   echo "     systemctl status chain-bridge, journalctl -u chain-bridge   состояние и журнал моста"
   echo
   echo "  ${B}Открыть панель (выполните на СВОЁМ компьютере):${R}"
@@ -4332,6 +4614,54 @@ run_install() {
   return $CHECK_FAIL
 }
 
+# ───────────────────────── обновление без переустановки ─────────────────────────
+# Ставит сторож моста (BACKEND) и chain-health (RELAY), добавляет keepalive мосту и чинит путь версии Xray в nginx.
+# Пользователи, пути клиентов, подписка и сертификат не меняются; мост перезапускается один раз.
+run_upgrade() {
+  INSTALL_KIND="chain"
+  STEP=0; TOTAL=3
+  if [ "$(marker_get ROLE)" = backend ]; then
+    fail "этот сервер — BACKEND: обновление запускают на RELAY"
+    return 1
+  fi
+  if [ -z "${DOMAIN:-}" ] || [ -z "${VER_PATH:-}" ] || [ ! -f /etc/nginx/sites-available/xpn.conf ]; then
+    fail "не найдены данные установки (домен, секретный путь, конфиг nginx): обновление возможно только на RELAY, настроенном этим скриптом"
+    return 1
+  fi
+  echo
+  echo "${B}Обновление до v$VERSION: сторож моста и keepalive${R}"
+  thin
+  info "RELAY: chain-health (состояние туннеля раз в 30 с) и путь /health в nginx; заодно исправляется путь версии Xray"
+  info "BACKEND: keepalive HTTP/2 для моста и chain-watchdog (проверка раз в 20 с); мост перезапустится один раз, потоки оборвутся на несколько секунд"
+  info "пользователи, пути клиентов, подписка и сертификат не меняются"
+  confirm "Продолжить?" || { echo "  Отменено."; return 0; }
+  section "Подключение к BACKEND"
+  ask_backend
+  [ "${LOCAL_BACKEND:-0}" = 1 ] || ssh_connect
+  make_scripts
+  section "RELAY: состояние туннеля для сторожа"
+  step_run "chain-health (таймер 30 с) и путь /health в nginx" lscript "$TMPD/health-relay.sh" "$VER_PATH" || die "RELAY не обновлён (см. лог)"
+  section "BACKEND: keepalive и сторож моста"
+  step_run "keepalive HTTP/2 для моста, chain-watchdog (таймер 20 с), перезапуск моста" rscript "$TMPD/watchdog-install.sh" || die "BACKEND не обновлён (см. лог)"
+  sed -i "s/^VERSION=.*/VERSION=$VERSION/" "$MARKER_FILE" 2>/dev/null || true
+  bk "sed -i 's/^VERSION=.*/VERSION=$VERSION/' '$MARKER_FILE' 2>/dev/null || true" >>"$LOG" 2>&1 || true
+  local i
+  for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do
+    [ "$(tunnel_conns)" -ge 1 ] && break
+    sleep 2
+  done
+  echo
+  rule
+  if [ "$(tunnel_conns)" -ge 1 ]; then ok "мост подключён к RELAY"; else warn "мост пока не подключён: проверьте journalctl -u chain-bridge на BACKEND"; fi
+  /usr/local/bin/chain-health --show 2>/dev/null || true
+  rule
+  echo "  ${B}Дальше${R}"
+  echo "   • RELAY:   chain-status, chain-health --show"
+  echo "   • BACKEND: chain-watchdog --status (решения сторожа и перезапуски), journalctl -t chain-watchdog"
+  echo "   • Сторож перезапускает мост, только если RELAY доступен, но не видит мост (около 1 мин) или сквозная проверка провалилась дважды (около 4 мин)"
+  echo
+}
+
 # ───────────────────────── откат ─────────────────────────
 backend_uninstall() {
   local rc=0
@@ -4342,8 +4672,9 @@ backend_uninstall() {
 
 relay_uninstall() {  # relay_uninstall rm_xui rm_web
   local rm_xui="$1" rm_web="$2" d="${DOMAIN:-$(marker_get DOMAIN)}"
-  systemctl disable --now chain-site-refresh.timer sync-sub-path.timer chain-xray-version.timer chain-xray-version.path >/dev/null 2>&1 || true
+  systemctl disable --now chain-site-refresh.timer sync-sub-path.timer chain-xray-version.timer chain-xray-version.path chain-health.timer >/dev/null 2>&1 || true
   rm -rf /var/lib/chain
+  rm -f /etc/systemd/system/chain-health.service /etc/systemd/system/chain-health.timer /usr/local/bin/chain-health /run/chain-health.lock
   rm -f /etc/systemd/system/chain-xray-version.service /etc/systemd/system/chain-xray-version.timer /etc/systemd/system/chain-xray-version.path \
     /usr/local/bin/chain-xray-version /etc/chain-site.endpoints
   rm -f /etc/systemd/system/chain-site-refresh.service /etc/systemd/system/chain-site-refresh.timer \
@@ -4478,6 +4809,7 @@ main() {
     prepare) run_prepare ;;
     install) run_install ;;
     uninstall) do_uninstall ;;
+    upgrade) run_upgrade ;;
   esac
 }
 
