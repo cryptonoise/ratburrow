@@ -16,13 +16,13 @@ MARKER_FILE="${MARKER_FILE:-/root/.chain-setup.installed}"
 PANEL_PORT=999
 SUB_TITLE="${SUB_TITLE:-}"   # название подписки в клиентах (Incy, Happ): спрашивается при установке
 CHAIN_USER_PORT=21443     # 127.0.0.1: инбаунд пользователей (за nginx)
-CHAIN_TUNNEL_PORT=21444   # 127.0.0.1: инбаунд туннеля (dokodemo-door+XHTTP, за nginx) — просто форвардит байты в tmn-relay
-CHAIN_TMN_RELAY_PORT=21445  # 127.0.0.1: tmn-relay слушает тут (без своего TLS — его делает Xray/nginx выше)
-CHAIN_TMN_SOCKS_PORT=21446  # 127.0.0.1: SOCKS5 tmn-relay, сюда Xray заворачивает трафик пользователей
+CHAIN_TUNNEL_PORT=21444   # 127.0.0.1: инбаунд туннеля (dokodemo-door+XHTTP, за nginx) — просто форвардит байты в shadow-relay
+CHAIN_SHADOW_RELAY_PORT=21445  # 127.0.0.1: shadow-relay слушает тут (без своего TLS — его делает Xray/nginx выше)
+CHAIN_SHADOW_SOCKS_PORT=21446  # 127.0.0.1: SOCKS5 shadow-relay, сюда Xray заворачивает трафик пользователей
 SELFTEST_PORT=21481       # 127.0.0.1: временный клиент для проверки цепочки
 TOTAL=12
 STEP=0
-CHAIN_USER_ID=""; CHAIN_SUB_ID=""; TMN_PSK=""; SUB_PATHS=""; TUNNEL_OBFS=0
+CHAIN_USER_ID=""; CHAIN_SUB_ID=""; SHADOW_PSK=""; SUB_PATHS=""; TUNNEL_OBFS=0
 
 # ───────────────────────── цвета ─────────────────────────
 if [ -t 1 ]; then
@@ -411,7 +411,7 @@ load_conf() {
   local f k v
   for f in "$CONF_FILE"; do
     [ -f "$f" ] || continue
-    for k in BACKEND_IP BACKEND_PORT DOMAIN KEY_PATH USER_PATH TUNNEL_PATH TMN_PSK TUNNEL_OBFS SUB_TITLE; do
+    for k in BACKEND_IP BACKEND_PORT DOMAIN KEY_PATH USER_PATH TUNNEL_PATH SHADOW_PSK TUNNEL_OBFS SUB_TITLE; do
       v=$(sed -n "s/^$k=//p" "$f" 2>/dev/null | head -n1)
       [ -n "$v" ] && printf -v "$k" '%s' "$v"
     done
@@ -430,7 +430,7 @@ EMAIL=${EMAIL:-}
 KEY_PATH=${KEY_PATH:-}
 USER_PATH=${USER_PATH:-}
 TUNNEL_PATH=${TUNNEL_PATH:-}
-TMN_PSK=${TMN_PSK:-}
+SHADOW_PSK=${SHADOW_PSK:-}
 HIDE_PANEL=${HIDE_PANEL:-}
 TUNNEL_OBFS=${TUNNEL_OBFS:-}
 SUB_TITLE=${SUB_TITLE:-}
@@ -3045,7 +3045,7 @@ st() { systemctl is-active --quiet "$1" && echo "работает" || echo "НЕ
 echo "nginx:        $(st nginx)"
 echo "3x-ui:        $(st x-ui)"
 n=$(ss -tnH state established "( sport = :21444 )" 2>/dev/null | wc -l)
-echo "туннель:      соединений от BACKEND: $n $([ "$n" -ge 1 ] && echo '(мост подключён)' || echo '(моста нет — проверьте tmn-bridge/chain-xray-local на BACKEND)')"
+echo "туннель:      соединений от BACKEND: $n $([ "$n" -ge 1 ] && echo '(мост подключён)' || echo '(моста нет — проверьте shadow-bridge/chain-xray-local на BACKEND)')"
 echo "BACKEND:      $(get BACKEND_IP) ($(head -n1 /etc/nginx/chain-backend.conf 2>/dev/null))"
 exp=$(openssl x509 -enddate -noout -in "/etc/letsencrypt/live/$D/fullchain.pem" 2>/dev/null | cut -d= -f2)
 echo "сертификат:   до ${exp:-?}"
@@ -3179,7 +3179,7 @@ WantedBy=timers.target
 EOT7
 # версия Xray на RELAY больше не публикуется отдельно: архитектура «Единый
 # отпечаток» не требует версийного лок-степа между RELAY и BACKEND — мост
-# (tmn-bridge) говорит с RELAY через XHTTP-транспорт Xray, а не через
+# (shadow-bridge) говорит с RELAY через XHTTP-транспорт Xray, а не через
 # VLESS-reverse внутренний протокол, и XHTTP wire-формат стабилен между
 # версиями ядра гораздо надёжнее, чем было нужно для reverse-семантики.
 systemctl daemon-reload
@@ -3375,8 +3375,8 @@ PYEOF
   cat > "$D/chain-inbounds.py" <<'PYEOF'
 import json, os, secrets, string, sys, urllib.parse, urllib.request, uuid
 
-base, token, domain, upath, tpath, uport, tport, tmn_relay_port, tmn_socks_port = sys.argv[1:10]
-uport, tport, tmn_relay_port, tmn_socks_port = int(uport), int(tport), int(tmn_relay_port), int(tmn_socks_port)
+base, token, domain, upath, tpath, uport, tport, shadow_relay_port, shadow_socks_port = sys.argv[1:10]
+uport, tport, shadow_relay_port, shadow_socks_port = int(uport), int(tport), int(shadow_relay_port), int(shadow_socks_port)
 tunnel_obfs = len(sys.argv) > 10 and sys.argv[10] == "1"   # padding-обфускация на туннеле BACKEND → RELAY
 
 
@@ -3459,9 +3459,9 @@ users_tag = next((i.get("tag") for i in inb_now if i.get("port") == uport), None
 
 # ───────────────────────── туннель: dokodemo-door + XHTTP ─────────────────────────
 # Архитектура «Единый отпечаток»: TUNNEL-инбаунд НЕ парсит никакой протокол (dokodemo-door
-# просто форвардит уже расшифрованные Xray'ем байты на локальный tmn-relay). AUTH,
-# мультиплексирование и anti-probing делает сама tmn-relay — поэтому здесь нет ни UUID,
-# ни reverse-тега: секрет (TMN_PSK) живёт только в файле на диске у tmn-relay/tmn-bridge,
+# просто форвардит уже расшифрованные Xray'ем байты на локальный shadow-relay). AUTH,
+# мультиплексирование и anti-probing делает сама shadow-relay — поэтому здесь нет ни UUID,
+# ни reverse-тега: секрет (SHADOW_PSK) живёт только в файле на диске у shadow-relay/shadow-bridge,
 # Xray о нём вообще не знает. Простая форма /panel/api/inbounds/add протокол dokodemo-door
 # не принимает (проверено: белый список protocol на этом эндпоинте его не содержит),
 # поэтому и создание инбаунда, и маршрутизация идут одним проходом через raw xraySetting.
@@ -3485,7 +3485,7 @@ if tunnel_inb:
 else:
     inbounds.append({
         "listen": "127.0.0.1", "port": tport, "protocol": "dokodemo-door",
-        "settings": {"address": "127.0.0.1", "port": tmn_relay_port, "network": "tcp"},
+        "settings": {"address": "127.0.0.1", "port": shadow_relay_port, "network": "tcp"},
         "streamSettings": json.loads(stream(tpath, None, tunnel_obfs, mode="stream-up")),
         "sniffing": {"enabled": False}, "tag": "TUNNEL",
     })
@@ -3494,13 +3494,13 @@ else:
 outbounds = xs.setdefault("outbounds", [])
 # ВАЖНО (проверено на живой панели): нельзя переиспользовать "direct" — у него свой
 # finalRules блокирует geoip:private, а dokodemo форвардит именно на 127.0.0.1 (локальный
-# tmn-relay). Без отдельного outbound Xray молча блэкхолит это соединение.
-if not any(ob.get("tag") == "tmn-local" for ob in outbounds):
-    outbounds.append({"protocol": "freedom", "tag": "tmn-local", "settings": {}})
+# shadow-relay). Без отдельного outbound Xray молча блэкхолит это соединение.
+if not any(ob.get("tag") == "shadow-local" for ob in outbounds):
+    outbounds.append({"protocol": "freedom", "tag": "shadow-local", "settings": {}})
     changed = True
-if not any(ob.get("tag") == "socks-tmn" for ob in outbounds):
-    outbounds.append({"protocol": "socks", "tag": "socks-tmn",
-                       "settings": {"servers": [{"address": "127.0.0.1", "port": tmn_socks_port}]}})
+if not any(ob.get("tag") == "socks-shadow" for ob in outbounds):
+    outbounds.append({"protocol": "socks", "tag": "socks-shadow",
+                       "settings": {"servers": [{"address": "127.0.0.1", "port": shadow_socks_port}]}})
     changed = True
 
 rules = xs.setdefault("routing", {}).setdefault("rules", [])
@@ -3524,11 +3524,11 @@ def ensure_rule(rule, before_private=False):
     changed = True
 
 
-# трафик пользователей -> локальный SOCKS tmn-relay (вместо старого r-tunnel)
-ensure_rule({"type": "field", "inboundTag": [users_tag], "outboundTag": "socks-tmn"})
+# трафик пользователей -> локальный SOCKS shadow-relay (вместо старого r-tunnel)
+ensure_rule({"type": "field", "inboundTag": [users_tag], "outboundTag": "socks-shadow"})
 # трафик TUNNEL-инбаунда -> отдельный outbound без блокировки приватных IP,
-# обязательно ДО правила geoip:private (иначе Xray заблокирует сам форвард на tmn-relay)
-ensure_rule({"type": "field", "inboundTag": ["TUNNEL"], "outboundTag": "tmn-local"}, before_private=True)
+# обязательно ДО правила geoip:private (иначе Xray заблокирует сам форвард на shadow-relay)
+ensure_rule({"type": "field", "inboundTag": ["TUNNEL"], "outboundTag": "shadow-local"}, before_private=True)
 
 if changed:
     r = api("/panel/api/xray/update", form={"xraySetting": json.dumps(xs),
@@ -3579,7 +3579,7 @@ if [ ${#need[@]} -gt 0 ]; then
 fi
 tmp=$(mktemp -d); trap 'rm -rf "$tmp"' EXIT
 
-# ── Xray (локальный, только loopback: принимает от tmn-bridge и выпускает
+# ── Xray (локальный, только loopback: принимает от shadow-bridge и выпускает
 #    наружу настоящим XHTTP+TLS клиентом — тем же кодом, что у пользователей) ──
 URL="https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-$ARCH.zip"
 curl -fsSL --retry 3 -o "$tmp/x.zip" "$URL"
@@ -3597,12 +3597,12 @@ relay, domain, tpath, tobfs = sys.argv[1:5]
 cfg = {
     "log": {"loglevel": "warning", "access": "none"},
     "inbounds": [
-        # tmn-bridge дозванивается сюда ОБЫЧНЫМ TCP на loopback; dokodemo-door
-        # ничего не парсит — чистый проброс байт. Эти байты tmn-bridge уже
-        # собрал как TMN-кадры, Xray только оборачивает их в честный XHTTP+TLS.
+        # shadow-bridge дозванивается сюда ОБЫЧНЫМ TCP на loopback; dokodemo-door
+        # ничего не парсит — чистый проброс байт. Эти байты shadow-bridge уже
+        # собрал как Shadow-кадры, Xray только оборачивает их в честный XHTTP+TLS.
         {"listen": "127.0.0.1", "port": 21900, "protocol": "dokodemo-door",
          "settings": {"address": "127.0.0.1", "port": 1, "network": "tcp"},
-         "tag": "tmn-local"}
+         "tag": "shadow-local"}
     ],
     "outbounds": [
         {"tag": "tunnel", "protocol": "freedom",
@@ -3612,7 +3612,7 @@ cfg = {
                              "xhttpSettings": {"host": domain, "path": "/" + tpath + "/", "mode": "stream-up",
                                                 "xPaddingBytes": "100-1000"}}},
     ],
-    "routing": {"rules": [{"type": "field", "inboundTag": ["tmn-local"], "outboundTag": "tunnel"}]},
+    "routing": {"rules": [{"type": "field", "inboundTag": ["shadow-local"], "outboundTag": "tunnel"}]},
 }
 if tobfs == "1":   # те же параметры padding, что на инбаунде туннеля у RELAY
     cfg["outbounds"][0]["streamSettings"]["xhttpSettings"].update(
@@ -3671,7 +3671,7 @@ AmbientCapabilities=
 WantedBy=multi-user.target
 EOT
 
-# ── Go-toolchain + tmn-bridge (сам TMN-протокол: AUTH, мультиплексирование;
+# ── Go-toolchain + shadow-bridge (сам Shadow-протокол: AUTH, мультиплексирование;
 #    TLS/uTLS больше не его забота — этим занимается chain-xray выше) ──
 command -v go >/dev/null 2>&1 && go version 2>/dev/null | grep -qE 'go1\.(2[4-9]|[3-9][0-9])' || {
   curl -fsSL --retry 3 -o "$tmp/dl.json" 'https://go.dev/dl/?mode=json'
@@ -3694,18 +3694,18 @@ PY
   tar -C /usr/local -xzf "$tmp/go.tgz"
   ln -sf /usr/local/go/bin/go /usr/local/bin/go
 }
-src=/opt/tmn-src
+src=/opt/shadow-src
 mkdir -p "$src"
 mkdir -p "$(dirname "$src"/go.mod)"
 cat > "$src"/go.mod <<'TBGO_MOD'
-module tmn
+module shadow
 
 go 1.24
 TBGO_MOD
 
 mkdir -p "$(dirname "$src"/mux/mux.go)"
 cat > "$src"/mux/mux.go <<'TBGO_MUXMUX'
-// Package mux — мультиплексирование потоков TMN/1: один writer-goroutine на
+// Package mux — мультиплексирование потоков Shadow/1: один writer-goroutine на
 // батчинг кадров, один reader-goroutine на диспетчеризацию по stream.
 package mux
 
@@ -3719,7 +3719,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"tmn/proto"
+	"shadow/proto"
 )
 
 const (
@@ -4567,7 +4567,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"tmn/proto"
+	"shadow/proto"
 )
 
 type recvChunk struct {
@@ -5033,10 +5033,10 @@ const (
 var (
 	ErrAuth   = errors.New("proto: AUTH отклонён")
 	ErrAuthOK = errors.New("proto: AUTH_OK битый")
-	authLabel = []byte("TMN1-AUTH")
+	authLabel = []byte("SHADOW1-AUTH")
 )
 
-// AuthTag = HMAC-SHA256(psk, "TMN1-AUTH" || exporter || ver || ts || nonce)[32].
+// AuthTag = HMAC-SHA256(psk, "SHADOW1-AUTH" || exporter || ver || ts || nonce)[32].
 // ver и ts — big-endian, как в заголовке кадра.
 // Контракт: len(psk) == len(exporter) == KeyLen. Длины проверяют MakeAuth и
 // VerifyAuth; сам AuthTag копирует в 32-байтовый слот сообщения и ошибку не
@@ -5234,9 +5234,9 @@ const (
 
 var (
 	ErrAuthV2     = errors.New("proto: AUTH v2 отклонён")
-	authV2Label   = []byte("TMN1-AUTH-V2")
-	authOKV2Label = []byte("TMN1-AUTH-OK-V2")
-	sessionV2Info = "TMN1-SESSION-V2"
+	authV2Label   = []byte("SHADOW1-AUTH-V2")
+	authOKV2Label = []byte("SHADOW1-AUTH-OK-V2")
+	sessionV2Info = "SHADOW1-SESSION-V2"
 )
 
 // NewEphemeralKeyV2 — эфемерная пара X25519 на одну сессию.
@@ -5249,7 +5249,7 @@ func PublicKeyV2(k *ecdh.PrivateKey) []byte { return k.PublicKey().Bytes() }
 
 // MakeAuthV2 собирает 82-байтовый AUTH v2:
 // ver u16 | ts u64 | nonce 8 | clientPub 32 | tag 32,
-// tag = HMAC-SHA256(psk, "TMN1-AUTH-V2" ‖ ver ‖ ts ‖ nonce ‖ clientPub).
+// tag = HMAC-SHA256(psk, "SHADOW1-AUTH-V2" ‖ ver ‖ ts ‖ nonce ‖ clientPub).
 func MakeAuthV2(psk, clientPub []byte, now time.Time) ([]byte, error) {
 	return makeAuthV2At(psk, clientPub, now, rand.Read)
 }
@@ -5309,7 +5309,7 @@ func authV2Tag(psk, ver, ts, nonce, pub []byte) [32]byte {
 
 // MakeAuthOKV2 собирает 74-байтовый AUTH_OK v2:
 // ver u16 | nonce 8 (эхо из AUTH) | serverPub 32 | tag 32,
-// tag = HMAC-SHA256(psk, "TMN1-AUTH-OK-V2" ‖ clientPub ‖ serverPub ‖ ts ‖ nonce).
+// tag = HMAC-SHA256(psk, "SHADOW1-AUTH-OK-V2" ‖ clientPub ‖ serverPub ‖ ts ‖ nonce).
 // Именно этот MAC не даёт MITM выдать себя за сервер.
 func MakeAuthOKV2(psk, clientPub, serverPub, nonce []byte, ts uint64) ([]byte, error) {
 	if len(psk) != KeyLen || len(clientPub) != PubKeyLen || len(serverPub) != PubKeyLen || len(nonce) != NonceLen {
@@ -5358,7 +5358,7 @@ func VerifyAuthOKV2(psk, payload, clientPub, nonce []byte, ts uint64) error {
 }
 
 // SessionKeyV2 — сессионный ключ: X25519(свой приватный, публичный пира) →
-// HKDF-SHA256(salt=psk, info="TMN1-SESSION-V2") → 32 байта.
+// HKDF-SHA256(salt=psk, info="SHADOW1-SESSION-V2") → 32 байта.
 // Знают только двое участников — это и есть привязка AUTH к соединению.
 func SessionKeyV2(psk []byte, priv *ecdh.PrivateKey, peerPub []byte) ([32]byte, error) {
 	var out [32]byte
@@ -5384,7 +5384,7 @@ TBGO_AUTH
 
 mkdir -p "$(dirname "$src"/proto/frame.go)"
 cat > "$src"/proto/frame.go <<'TBGO_FRAME'
-// Package proto — кадрирование и AUTH TMN/1 (docs/07-proto-v1-spec.md, §2 и §4).
+// Package proto — кадрирование и AUTH Shadow/1 (docs/07-proto-v1-spec.md, §2 и §4).
 package proto
 
 import (
@@ -5636,9 +5636,9 @@ func TargetLen(b []byte) int {
 }
 TBGO_TARGET
 
-mkdir -p "$(dirname "$src"/cmd/tmn-bridge/main.go)"
-cat > "$src"/cmd/tmn-bridge/main.go <<'TBGO_MAIN'
-// tmn-bridge — продакшен-версия, BACKEND (зарубеж).
+mkdir -p "$(dirname "$src"/cmd/shadow-bridge/main.go)"
+cat > "$src"/cmd/shadow-bridge/main.go <<'TBGO_MAIN'
+// shadow-bridge — продакшен-версия, BACKEND (зарубеж).
 //
 // Архитектура «Единый отпечаток»: эта программа НЕ делает TLS/uTLS сама —
 // за неё это делает локальный Xray (тот же chain-xray, что и раньше),
@@ -5651,7 +5651,7 @@ cat > "$src"/cmd/tmn-bridge/main.go <<'TBGO_MAIN'
 // тот же код.
 //
 // После AUTH (PSK, AuthV2) принимает потоки от RELAY (RELAY открывает,
-// здесь только принимают — см. комментарий в cmd/tmn-relay) и сама
+// здесь только принимают — см. комментарий в cmd/shadow-relay) и сама
 // делает egress в интернет с той же политикой блокировки приватных
 // диапазонов, что была у исходного chain-bridge.
 package main
@@ -5668,8 +5668,8 @@ import (
 	"syscall"
 	"time"
 
-	"tmn/mux"
-	"tmn/proto"
+	"shadow/mux"
+	"shadow/proto"
 )
 
 type conf struct {
@@ -5819,7 +5819,7 @@ func blocked(host string) bool {
 }
 
 func main() {
-	path := "/etc/tmn-bridge/tmn-bridge.toml"
+	path := "/etc/shadow-bridge/shadow-bridge.toml"
 	if len(os.Args) > 2 && os.Args[1] == "-config" {
 		path = os.Args[2]
 	}
@@ -5913,20 +5913,20 @@ func handleStream(st *mux.Stream) {
 	wg.Wait()
 }
 TBGO_MAIN
-( cd "$src" && /usr/local/bin/go build -o /usr/local/bin/tmn-bridge ./cmd/tmn-bridge )
+( cd "$src" && /usr/local/bin/go build -o /usr/local/bin/shadow-bridge ./cmd/shadow-bridge )
 
-mkdir -p /etc/tmn-bridge
-printf '%s' "$TPSK" > /etc/tmn-bridge/psk
-chmod 600 /etc/tmn-bridge/psk
-cat > /etc/tmn-bridge/tmn-bridge.toml <<EOT
+mkdir -p /etc/shadow-bridge
+printf '%s' "$TPSK" > /etc/shadow-bridge/psk
+chmod 600 /etc/shadow-bridge/psk
+cat > /etc/shadow-bridge/shadow-bridge.toml <<EOT
 dial = "127.0.0.1:21900"
-psk_file = "/etc/tmn-bridge/psk"
+psk_file = "/etc/shadow-bridge/psk"
 EOT
-chmod 600 /etc/tmn-bridge/tmn-bridge.toml
+chmod 600 /etc/shadow-bridge/shadow-bridge.toml
 
-cat > /etc/systemd/system/tmn-bridge.service <<'EOT'
+cat > /etc/systemd/system/shadow-bridge.service <<'EOT'
 [Unit]
-Description=tmn-bridge (TMN/1 reverse dialer, через локальный chain-xray)
+Description=shadow-bridge (Shadow/1 reverse dialer, через локальный chain-xray)
 After=network-online.target chain-xray-local.service
 Wants=network-online.target
 Requires=chain-xray-local.service
@@ -5934,12 +5934,12 @@ Requires=chain-xray-local.service
 [Service]
 User=chainbridge
 Group=chainbridge
-ExecStart=/usr/local/bin/tmn-bridge -config /etc/tmn-bridge/tmn-bridge.toml
+ExecStart=/usr/local/bin/shadow-bridge -config /etc/shadow-bridge/shadow-bridge.toml
 Restart=always
 RestartSec=2
 NoNewPrivileges=yes
 ProtectSystem=strict
-ReadWritePaths=/etc/tmn-bridge
+ReadWritePaths=/etc/shadow-bridge
 ProtectHome=yes
 PrivateTmp=yes
 
@@ -5948,12 +5948,12 @@ WantedBy=multi-user.target
 EOT
 
 systemctl daemon-reload
-systemctl enable chain-xray-local tmn-bridge >/dev/null 2>&1
+systemctl enable chain-xray-local shadow-bridge >/dev/null 2>&1
 systemctl restart chain-xray-local
 sleep 2
-systemctl restart tmn-bridge
+systemctl restart shadow-bridge
 sleep 3
-systemctl is-active --quiet chain-xray-local && systemctl is-active --quiet tmn-bridge
+systemctl is-active --quiet chain-xray-local && systemctl is-active --quiet shadow-bridge
 EOF
 
   # BACKEND: firewall — только SSH (все остальные входящие закрыты)
@@ -5977,10 +5977,10 @@ EOF
 
   # BACKEND: откат моста
   cat > "$D/uninstall-backend.sh" <<'EOF'
-systemctl disable --now tmn-bridge chain-xray-local >/dev/null 2>&1 || true
-rm -f /etc/systemd/system/tmn-bridge.service /etc/systemd/system/chain-xray-local.service \
-  /usr/local/bin/tmn-bridge /usr/local/bin/chain-xray /usr/local/bin/chain-set-relay
-rm -rf /etc/chain-bridge /etc/tmn-bridge /opt/tmn-src
+systemctl disable --now shadow-bridge chain-xray-local >/dev/null 2>&1 || true
+rm -f /etc/systemd/system/shadow-bridge.service /etc/systemd/system/chain-xray-local.service \
+  /usr/local/bin/shadow-bridge /usr/local/bin/chain-xray /usr/local/bin/chain-set-relay
+rm -rf /etc/chain-bridge /etc/shadow-bridge /opt/shadow-src
 userdel chainbridge >/dev/null 2>&1 || true
 rm -f /etc/sysctl.d/99-relay-network-tuning.conf /etc/modules-load.d/relay-bbr.conf
 systemctl daemon-reload
@@ -6048,26 +6048,60 @@ xui_stage() {
   rule
 }
 
-# ───────────────────────── RELAY: сборка и установка tmn-relay ─────────────────────────
-# tmn-relay слушает локально (TMN_RELAY_PORT), Xray-инбаунд TUNNEL
+# ───────────────────────── RELAY: сборка и установка shadow-relay ─────────────────────────
+# shadow-relay слушает локально (SHADOW_RELAY_PORT), Xray-инбаунд TUNNEL
 # (dokodemo-door+XHTTP, см. chain-inbounds.py) форвардит туда уже
 # расшифрованные байты. Отдельного TLS и отдельного открытого порта наружу
-# у tmn-relay нет — снаружи это тот же самый 443, тот же сертификат, что и
+# у shadow-relay нет — снаружи это тот же самый 443, тот же сертификат, что и
 # у обычных пользователей.
-relay_tmn_install() {
+# ── Go-toolchain (нужен только для сборки shadow-relay/shadow-bridge из исходников) ──
+install_go_toolchain() {
+  command -v go >/dev/null 2>&1 && go version 2>/dev/null | grep -qE 'go1\.(2[4-9]|[3-9][0-9])' && return 0
+  case "$(uname -m)" in
+    x86_64 | amd64) GOARCH=amd64 ;;
+    aarch64 | arm64) GOARCH=arm64 ;;
+    *) echo "неподдерживаемая архитектура для сборки Go: $(uname -m)" >&2; return 1 ;;
+  esac
+  local tmp; tmp=$(mktemp -d); trap 'rm -rf "$tmp"' RETURN
+  curl -fsSL --retry 3 -o "$tmp/dl.json" 'https://go.dev/dl/?mode=json' || return 1
+  python3 - "$GOARCH" "$tmp/dl.json" > "$tmp/pick" <<'PY'
+import json, sys
+arch, path = sys.argv[1], sys.argv[2]
+rels = json.load(open(path))
+for r in rels:
+    if not r.get("stable"):
+        continue
+    for f in r.get("files", []):
+        if f.get("os") == "linux" and f.get("arch") == arch and f.get("kind") == "archive":
+            print(f["filename"], f["sha256"])
+            sys.exit(0)
+sys.exit("подходящий релиз Go не найден")
+PY
+  read -r GOFILE GOSHA < "$tmp/pick"
+  [ -n "${GOFILE:-}" ] || { echo "не удалось определить файл Go-toolchain" >&2; return 1; }
+  curl -fsSL --retry 3 -o "$tmp/go.tgz" "https://go.dev/dl/$GOFILE" || return 1
+  have=$(sha256sum "$tmp/go.tgz" | awk '{print $1}')
+  [ "$have" = "$GOSHA" ] || { echo "контрольная сумма Go toolchain не совпала" >&2; return 1; }
+  rm -rf /usr/local/go
+  tar -C /usr/local -xzf "$tmp/go.tgz"
+  ln -sf /usr/local/go/bin/go /usr/local/bin/go
+  ln -sf /usr/local/go/bin/gofmt /usr/local/bin/gofmt
+}
+
+relay_shadow_install() {
   install_go_toolchain || return 1
-  local src=/opt/tmn-src
+  local src=/opt/shadow-src
   mkdir -p "$src"
 mkdir -p "$(dirname "$src"/go.mod)"
 cat > "$src"/go.mod <<'TRGO_MOD'
-module tmn
+module shadow
 
 go 1.24
 TRGO_MOD
 
 mkdir -p "$(dirname "$src"/mux/mux.go)"
 cat > "$src"/mux/mux.go <<'TRGO_MUXMUX'
-// Package mux — мультиплексирование потоков TMN/1: один writer-goroutine на
+// Package mux — мультиплексирование потоков Shadow/1: один writer-goroutine на
 // батчинг кадров, один reader-goroutine на диспетчеризацию по stream.
 package mux
 
@@ -6081,7 +6115,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"tmn/proto"
+	"shadow/proto"
 )
 
 const (
@@ -6929,7 +6963,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"tmn/proto"
+	"shadow/proto"
 )
 
 type recvChunk struct {
@@ -7395,10 +7429,10 @@ const (
 var (
 	ErrAuth   = errors.New("proto: AUTH отклонён")
 	ErrAuthOK = errors.New("proto: AUTH_OK битый")
-	authLabel = []byte("TMN1-AUTH")
+	authLabel = []byte("SHADOW1-AUTH")
 )
 
-// AuthTag = HMAC-SHA256(psk, "TMN1-AUTH" || exporter || ver || ts || nonce)[32].
+// AuthTag = HMAC-SHA256(psk, "SHADOW1-AUTH" || exporter || ver || ts || nonce)[32].
 // ver и ts — big-endian, как в заголовке кадра.
 // Контракт: len(psk) == len(exporter) == KeyLen. Длины проверяют MakeAuth и
 // VerifyAuth; сам AuthTag копирует в 32-байтовый слот сообщения и ошибку не
@@ -7596,9 +7630,9 @@ const (
 
 var (
 	ErrAuthV2     = errors.New("proto: AUTH v2 отклонён")
-	authV2Label   = []byte("TMN1-AUTH-V2")
-	authOKV2Label = []byte("TMN1-AUTH-OK-V2")
-	sessionV2Info = "TMN1-SESSION-V2"
+	authV2Label   = []byte("SHADOW1-AUTH-V2")
+	authOKV2Label = []byte("SHADOW1-AUTH-OK-V2")
+	sessionV2Info = "SHADOW1-SESSION-V2"
 )
 
 // NewEphemeralKeyV2 — эфемерная пара X25519 на одну сессию.
@@ -7611,7 +7645,7 @@ func PublicKeyV2(k *ecdh.PrivateKey) []byte { return k.PublicKey().Bytes() }
 
 // MakeAuthV2 собирает 82-байтовый AUTH v2:
 // ver u16 | ts u64 | nonce 8 | clientPub 32 | tag 32,
-// tag = HMAC-SHA256(psk, "TMN1-AUTH-V2" ‖ ver ‖ ts ‖ nonce ‖ clientPub).
+// tag = HMAC-SHA256(psk, "SHADOW1-AUTH-V2" ‖ ver ‖ ts ‖ nonce ‖ clientPub).
 func MakeAuthV2(psk, clientPub []byte, now time.Time) ([]byte, error) {
 	return makeAuthV2At(psk, clientPub, now, rand.Read)
 }
@@ -7671,7 +7705,7 @@ func authV2Tag(psk, ver, ts, nonce, pub []byte) [32]byte {
 
 // MakeAuthOKV2 собирает 74-байтовый AUTH_OK v2:
 // ver u16 | nonce 8 (эхо из AUTH) | serverPub 32 | tag 32,
-// tag = HMAC-SHA256(psk, "TMN1-AUTH-OK-V2" ‖ clientPub ‖ serverPub ‖ ts ‖ nonce).
+// tag = HMAC-SHA256(psk, "SHADOW1-AUTH-OK-V2" ‖ clientPub ‖ serverPub ‖ ts ‖ nonce).
 // Именно этот MAC не даёт MITM выдать себя за сервер.
 func MakeAuthOKV2(psk, clientPub, serverPub, nonce []byte, ts uint64) ([]byte, error) {
 	if len(psk) != KeyLen || len(clientPub) != PubKeyLen || len(serverPub) != PubKeyLen || len(nonce) != NonceLen {
@@ -7720,7 +7754,7 @@ func VerifyAuthOKV2(psk, payload, clientPub, nonce []byte, ts uint64) error {
 }
 
 // SessionKeyV2 — сессионный ключ: X25519(свой приватный, публичный пира) →
-// HKDF-SHA256(salt=psk, info="TMN1-SESSION-V2") → 32 байта.
+// HKDF-SHA256(salt=psk, info="SHADOW1-SESSION-V2") → 32 байта.
 // Знают только двое участников — это и есть привязка AUTH к соединению.
 func SessionKeyV2(psk []byte, priv *ecdh.PrivateKey, peerPub []byte) ([32]byte, error) {
 	var out [32]byte
@@ -7746,7 +7780,7 @@ TRGO_AUTH
 
 mkdir -p "$(dirname "$src"/proto/frame.go)"
 cat > "$src"/proto/frame.go <<'TRGO_FRAME'
-// Package proto — кадрирование и AUTH TMN/1 (docs/07-proto-v1-spec.md, §2 и §4).
+// Package proto — кадрирование и AUTH Shadow/1 (docs/07-proto-v1-spec.md, §2 и §4).
 package proto
 
 import (
@@ -7998,9 +8032,9 @@ func TargetLen(b []byte) int {
 }
 TRGO_TARGET
 
-mkdir -p "$(dirname "$src"/cmd/tmn-relay/main.go)"
-cat > "$src"/cmd/tmn-relay/main.go <<'TRGO_MAIN'
-// tmn-relay — продакшен-версия, RELAY (РФ).
+mkdir -p "$(dirname "$src"/cmd/shadow-relay/main.go)"
+cat > "$src"/cmd/shadow-relay/main.go <<'TRGO_MAIN'
+// shadow-relay — продакшен-версия, RELAY (РФ).
 //
 // Архитектура «Единый отпечаток»: эта программа НЕ держит собственный TLS.
 // TLS и XHTTP-грамматику делает Xray (тот же процесс и код, что обслуживает
@@ -8010,7 +8044,7 @@ cat > "$src"/cmd/tmn-relay/main.go <<'TRGO_MAIN'
 // же самый 443-порт, тот же сертификат, та же XHTTP-грамматика, что и у
 // обычных пользователей — отдельной открытой поверхности не появляется.
 //
-// На каждое входящее соединение: пикаем первые 8 байт. Похоже на TMN
+// На каждое входящее соединение: пикаем первые 8 байт. Похоже на Shadow
 // AUTH-кадр -> поднимаем mux-сессию (PSK, AuthV2) и кладём в пул. Иначе ->
 // отдаём сайт-прикрытие настоящим HTTP-ответом (200/404/405), а не просто
 // держим соединение до таймаута.
@@ -8034,8 +8068,8 @@ import (
 	"syscall"
 	"time"
 
-	"tmn/mux"
-	"tmn/proto"
+	"shadow/mux"
+	"shadow/proto"
 )
 
 type conf struct {
@@ -8268,7 +8302,7 @@ type peeked struct {
 
 func (c *peeked) Read(p []byte) (int, error) { return c.r.Read(p) }
 
-func tmnFrame(b []byte) bool {
+func shadowFrame(b []byte) bool {
 	if len(b) < 8 || b[0] != proto.TypeAuth {
 		return false
 	}
@@ -8277,7 +8311,7 @@ func tmnFrame(b []byte) bool {
 }
 
 func main() {
-	path := "/etc/tmn-relay/tmn-relay.toml"
+	path := "/etc/shadow-relay/shadow-relay.toml"
 	if len(os.Args) > 2 && os.Args[1] == "-config" {
 		path = os.Args[2]
 	}
@@ -8318,7 +8352,7 @@ func main() {
 		slog.Error("listen", "err", err)
 		os.Exit(1)
 	}
-	slog.Info("tmn-relay слушает (за dokodemo-door+XHTTP, без своего TLS)", "addr", c.Listen)
+	slog.Info("shadow-relay слушает (за dokodemo-door+XHTTP, без своего TLS)", "addr", c.Listen)
 
 	go acceptLoop(ln, psk, p, httpSrv)
 	runSocks(c.SocksAddr, p)
@@ -8342,13 +8376,13 @@ func acceptLoop(ln net.Listener, psk *pskStore, p *pool, httpSrv *http.Server) {
 			raw.SetReadDeadline(time.Time{})
 			conn := &peeked{Conn: raw, r: br}
 
-			if tmnFrame(hdr) {
+			if shadowFrame(hdr) {
 				s, err := mux.New(conn, mux.Config{IsClient: false, PSK: psk.get(), AuthV2: true})
 				if err == nil {
 					p.add(s)
 					return
 				}
-				slog.Debug("похоже на TMN, но AUTH не сошёлся", "err", err)
+				slog.Debug("похоже на Shadow, но AUTH не сошёлся", "err", err)
 			}
 			httpSrv.Serve(&oneConn{c: conn, a: raw.LocalAddr()})
 		}()
@@ -8444,38 +8478,38 @@ func handleSocks(c net.Conn, p *pool) {
 	wg.Wait()
 }
 TRGO_MAIN
-  ( cd "$src" && /usr/local/bin/go build -o /usr/local/bin/tmn-relay ./cmd/tmn-relay ) || return 1
+  ( cd "$src" && /usr/local/bin/go build -o /usr/local/bin/shadow-relay ./cmd/shadow-relay ) || return 1
 
-  mkdir -p /etc/tmn-relay
-  if [ ! -s /etc/tmn-relay/psk ]; then
-    openssl rand -hex 32 > /etc/tmn-relay/psk
+  mkdir -p /etc/shadow-relay
+  if [ ! -s /etc/shadow-relay/psk ]; then
+    openssl rand -hex 32 > /etc/shadow-relay/psk
   fi
-  chmod 600 /etc/tmn-relay/psk
+  chmod 600 /etc/shadow-relay/psk
 
   local cover="/var/www/honeypot/$DOMAIN"
-  cat > /etc/tmn-relay/tmn-relay.toml <<EOT
-listen = "127.0.0.1:$CHAIN_TMN_RELAY_PORT"
-psk_file = "/etc/tmn-relay/psk"
-socks_listen = "127.0.0.1:$CHAIN_TMN_SOCKS_PORT"
+  cat > /etc/shadow-relay/shadow-relay.toml <<EOT
+listen = "127.0.0.1:$CHAIN_SHADOW_RELAY_PORT"
+psk_file = "/etc/shadow-relay/psk"
+socks_listen = "127.0.0.1:$CHAIN_SHADOW_SOCKS_PORT"
 cover_dir = "$cover"
 EOT
-  chmod 600 /etc/tmn-relay/tmn-relay.toml
+  chmod 600 /etc/shadow-relay/shadow-relay.toml
 
-  cat > /etc/systemd/system/tmn-relay.service <<'EOT'
+  cat > /etc/systemd/system/shadow-relay.service <<'EOT'
 [Unit]
-Description=tmn-relay (TMN/1 reverse acceptor, behind dokodemo-door+XHTTP)
+Description=shadow-relay (Shadow/1 reverse acceptor, behind dokodemo-door+XHTTP)
 After=network-online.target
 Wants=network-online.target
 Before=x-ui.service
 
 [Service]
 Type=simple
-ExecStart=/usr/local/bin/tmn-relay -config /etc/tmn-relay/tmn-relay.toml
+ExecStart=/usr/local/bin/shadow-relay -config /etc/shadow-relay/shadow-relay.toml
 Restart=always
 RestartSec=2
 NoNewPrivileges=yes
 ProtectSystem=strict
-ReadWritePaths=/etc/tmn-relay
+ReadWritePaths=/etc/shadow-relay
 ProtectHome=yes
 PrivateTmp=yes
 
@@ -8483,9 +8517,9 @@ PrivateTmp=yes
 WantedBy=multi-user.target
 EOT
   systemctl daemon-reload
-  systemctl enable --now tmn-relay >/dev/null 2>&1
+  systemctl enable --now shadow-relay >/dev/null 2>&1
   sleep 1
-  systemctl is-active --quiet tmn-relay
+  systemctl is-active --quiet shadow-relay
 }
 
 # инбаунды и маршрутизация в 3x-ui; результат: CHAIN_USER_ID, CHAIN_SUB_ID, TUNNEL_OBFS
@@ -8494,7 +8528,7 @@ EOT
 chain_inbounds() {
   local out cu sb to
   [ -n "${xt:-}" ] || return 1
-  out=$(python3 "$TMPD/chain-inbounds.py" "http://127.0.0.1:$PANEL_PORT/${xw#/}" "$xt" "$DOMAIN" "$USER_PATH" "$TUNNEL_PATH" "$CHAIN_USER_PORT" "$CHAIN_TUNNEL_PORT" "$CHAIN_TMN_RELAY_PORT" "$CHAIN_TMN_SOCKS_PORT" "${TUNNEL_OBFS:-0}" 2>>"$LOG") || return 1
+  out=$(python3 "$TMPD/chain-inbounds.py" "http://127.0.0.1:$PANEL_PORT/${xw#/}" "$xt" "$DOMAIN" "$USER_PATH" "$TUNNEL_PATH" "$CHAIN_USER_PORT" "$CHAIN_TUNNEL_PORT" "$CHAIN_SHADOW_RELAY_PORT" "$CHAIN_SHADOW_SOCKS_PORT" "${TUNNEL_OBFS:-0}" 2>>"$LOG") || return 1
   cu=$(printf '%s' "$out" | python3 -c 'import json,sys; print(json.load(sys.stdin)["user_id"])') || return 1
   sb=$(printf '%s' "$out" | python3 -c 'import json,sys; print(json.load(sys.stdin)["sub_id"])') || return 1
   to=$(printf '%s' "$out" | python3 -c 'import json,sys; print(json.load(sys.stdin)["tunnel_obfs"])') || return 1
@@ -8508,10 +8542,10 @@ chain_load() {  # читает результат chain_inbounds в переме
   [ -n "${CHAIN_USER_ID:-}" ]
 }
 
-# мост BACKEND: установка и запуск. Секрет между tmn-relay и tmn-bridge — TMN_PSK
+# мост BACKEND: установка и запуск. Секрет между shadow-relay и shadow-bridge — SHADOW_PSK
 # (не VLESS UUID: туннельный инбаунд теперь dokodemo-door, у него нет понятия клиента)
 backend_bridge() {
-  rscript "$TMPD/bridge-install.sh" "$RELAY_IP" "$DOMAIN" "$TUNNEL_PATH" "$TMN_PSK" "${TUNNEL_OBFS:-0}"
+  rscript "$TMPD/bridge-install.sh" "$RELAY_IP" "$DOMAIN" "$TUNNEL_PATH" "$SHADOW_PSK" "${TUNNEL_OBFS:-0}"
 }
 
 # число соединений моста, пришедших на инбаунд туннеля
@@ -8576,7 +8610,7 @@ check_reinstall() {
     warn "установка уже выполнялась (метка: $(marker_get INSTALLED_AT), статус: $(marker_get STATUS))"
     confirm "Удалить всё и установить заново?" n || { echo "  Отменено."; exit 0; }
     do_uninstall || exit 0
-    USER_PATH=""; TUNNEL_PATH=""; TMN_PSK=""   # новая установка — новые секретные пути
+    USER_PATH=""; TUNNEL_PATH=""; SHADOW_PSK=""   # новая установка — новые секретные пути
   fi
 }
 
@@ -8632,7 +8666,7 @@ run_install() {
 
   USER_PATH="${USER_PATH:-$(openssl rand -hex 12)}"
   TUNNEL_PATH="${TUNNEL_PATH:-$(openssl rand -hex 12)}"
-  TMN_PSK="${TMN_PSK:-$(openssl rand -hex 32)}"   # 32 байта — секрет TMN-уровня между tmn-relay и tmn-bridge
+  SHADOW_PSK="${SHADOW_PSK:-$(openssl rand -hex 32)}"   # 32 байта — секрет Shadow-уровня между shadow-relay и shadow-bridge
 
   # ── сводка
   echo
@@ -8650,7 +8684,7 @@ run_install() {
   else
     kv "3x-ui panel" "https://$DOMAIN/<WebBasePath> → RELAY 127.0.0.1:$PANEL_PORT; подписка для Incy там же"
   fi
-  kv "Tunnel" "BACKEND → RELAY:443, TLS 1.3, отпечаток Chrome, dokodemo-door+XHTTP (та же грамматика, что у пользователей) → tmn-relay/tmn-bridge (TMN/1, PSK-AUTH, без второго TLS)"
+  kv "Tunnel" "BACKEND → RELAY:443, TLS 1.3, отпечаток Chrome, dokodemo-door+XHTTP (та же грамматика, что у пользователей) → shadow-relay/shadow-bridge (Shadow/1, PSK-AUTH, без второго TLS)"
   kv "E-mail" "$EMAIL"
   kv "BACKEND ports" "все входящие закрываются, остаётся только SSH"
   rule
@@ -8721,7 +8755,7 @@ run_install() {
   /usr/local/bin/chain-site-refresh >>"$LOG" 2>&1 || warn "страницы статуса не созданы"
   SUB_PATHS=$(lscript "$TMPD/sub-setup.sh" "$DOMAIN" https "$SUB_TITLE" 2>>"$LOG" | tail -n1)
   if [ -n "$SUB_PATHS" ]; then ok "подписка: путь из панели $SUB_PATHS (nginx подхватит за ~15 с)"; else warn "не удалось настроить подписку (см. лог)"; fi
-  step_run "tmn-relay: сборка из исходников (Go) и запуск (анти-probing, SOCKS для Xray)" relay_tmn_install || die "не удалось собрать/запустить tmn-relay (см. лог)"
+  step_run "shadow-relay: сборка из исходников (Go) и запуск (анти-probing, SOCKS для Xray)" relay_shadow_install || die "не удалось собрать/запустить shadow-relay (см. лог)"
   step_run "3x-ui: инбаунд пользователей (VLESS+XHTTP), инбаунд туннеля (dokodemo-door+XHTTP), маршрутизация" chain_inbounds || die "не удалось настроить 3x-ui через API (см. лог)"
   chain_load || die "3x-ui не вернул идентификаторы инбаундов (см. лог)"
   save_conf
@@ -8731,7 +8765,7 @@ run_install() {
 
   # [10] мост на BACKEND
   section "BACKEND: мост Xray"
-  step_run "Установка Xray и tmn-bridge (проверка SHA-256) и запуск моста" backend_bridge || die "мост не запустился (journalctl -u chain-xray-local -u tmn-bridge на BACKEND)"
+  step_run "Установка Xray и shadow-bridge (проверка SHA-256) и запуск моста" backend_bridge || die "мост не запустился (journalctl -u chain-xray-local -u shadow-bridge на BACKEND)"
 
   # [11] проверка цепочки
   section "Проверка цепочки"
@@ -8740,7 +8774,7 @@ run_install() {
     [ "$(tunnel_conns)" -ge 1 ] && break
     sleep 2
   done
-  if [ "$(tunnel_conns)" -ge 1 ]; then ok "мост подключился к RELAY (туннельный путь, HTTP/2)"; else warn "мост пока не подключился: проверьте journalctl -u chain-xray-local -u tmn-bridge на BACKEND"; fi
+  if [ "$(tunnel_conns)" -ge 1 ]; then ok "мост подключился к RELAY (туннельный путь, HTTP/2)"; else warn "мост пока не подключился: проверьте journalctl -u chain-xray-local -u shadow-bridge на BACKEND"; fi
   local st=1 stout=""
   for i in 1 2 3; do
     if stout=$(chain_selftest 2>>"$LOG"); then st=0; break; fi
@@ -8751,7 +8785,7 @@ run_install() {
   if [ $st -eq 0 ]; then
     ok "поток через цепочку работает: выходной IP совпадает с BACKEND"
   elif [ -z "$stout" ] || [[ "$stout" == *"цепочки: нет ответа"* ]]; then
-    fail "трафик через цепочку не проходит (ответа нет). Диагностика: chain-test на RELAY; journalctl -u tmn-bridge -n 50 на BACKEND"
+    fail "трафик через цепочку не проходит (ответа нет). Диагностика: chain-test на RELAY; journalctl -u shadow-bridge -n 50 на BACKEND"
     CHECK_FAIL=1
   else
     warn "выходной IP цепочки отличается от внешнего IP BACKEND (общий NAT или несколько адресов); если у клиента интернет работает, это не ошибка"
@@ -8825,7 +8859,7 @@ run_install() {
   echo "     sync-sub-path                прописать пути подписки из 3x-ui в nginx (таймер; вручную — после смены путей в панели)"
   echo "   BACKEND:"
   echo "     chain-set-relay IP           указать новый IP RELAY и перезапустить мост (chain-xray-local)"
-  echo "     systemctl status tmn-bridge chain-xray-local, journalctl -u tmn-bridge -u chain-xray-local   состояние и журнал моста"
+  echo "     systemctl status shadow-bridge chain-xray-local, journalctl -u shadow-bridge -u chain-xray-local   состояние и журнал моста"
   echo
   echo "  ${B}Открыть панель (выполните на СВОЁМ компьютере):${R}"
   echo "   1) создать туннель — строка целиком, замените только ПУТЬ_К_КЛЮЧУ на путь к приватному ключу"
@@ -8852,9 +8886,9 @@ backend_uninstall() {
 
 relay_uninstall() {  # relay_uninstall rm_xui rm_web
   local rm_xui="$1" rm_web="$2" d="${DOMAIN:-$(marker_get DOMAIN)}"
-  systemctl disable --now chain-site-refresh.timer sync-sub-path.timer tmn-relay >/dev/null 2>&1 || true
-  rm -rf /var/lib/chain /etc/tmn-relay /opt/tmn-src
-  rm -f /etc/systemd/system/tmn-relay.service /usr/local/bin/tmn-relay /etc/chain-site.endpoints
+  systemctl disable --now chain-site-refresh.timer sync-sub-path.timer shadow-relay >/dev/null 2>&1 || true
+  rm -rf /var/lib/chain /etc/shadow-relay /opt/shadow-src
+  rm -f /etc/systemd/system/shadow-relay.service /usr/local/bin/shadow-relay /etc/chain-site.endpoints
   rm -f /etc/systemd/system/chain-site-refresh.service /etc/systemd/system/chain-site-refresh.timer \
     /etc/systemd/system/sync-sub-path.service /etc/systemd/system/sync-sub-path.timer \
     /usr/local/bin/chain-status /usr/local/bin/chain-test /usr/local/bin/chain-set-backend /usr/local/bin/chain-site-refresh /usr/local/bin/sync-sub-path \
@@ -8883,7 +8917,7 @@ do_uninstall_backend() {
   echo "${B}Будет удалено${R}"
   thin
   echo "  ${B}BACKEND${R} (этот сервер):"
-  info "мост tmn-bridge, локальный chain-xray-local и команда chain-set-relay"
+  info "мост shadow-bridge, локальный chain-xray-local и команда chain-set-relay"
   info "сетевые настройки (BBR, буферы TCP); firewall остаётся закрытым, только SSH"
   info "RELAY этим откатом не затрагивается"
   echo
@@ -8939,13 +8973,13 @@ do_uninstall() {
   echo "  ${B}RELAY${R} (этот сервер, $RELAY_IP):"
   [ $rm_xui -eq 1 ] && info "3x-ui: панель, пользователи и инбаунды VPN и TUNNEL"
   [ $rm_web -eq 1 ] && info "nginx: конфиг xpn.conf, сайт-приманка, сертификат Let's Encrypt для ${d:-домена}, разрешения ufw для портов 80 и 443"
-  info "служебные команды chain-status, chain-test, chain-set-backend, chain-site-refresh, sync-sub-path и их таймеры; tmn-relay"
+  info "служебные команды chain-status, chain-test, chain-set-backend, chain-site-refresh, sync-sub-path и их таймеры; shadow-relay"
   info "сетевые настройки (BBR, буферы TCP)"
   if [ "$scope" = 1 ]; then
     echo "  ${B}BACKEND${R}: не затрагивается"
   elif [ $reach -eq 1 ]; then
     echo "  ${B}BACKEND${R} ($BACKEND_IP):"
-    info "мост tmn-bridge, локальный chain-xray-local и команда chain-set-relay"
+    info "мост shadow-bridge, локальный chain-xray-local и команда chain-set-relay"
     info "сетевые настройки (BBR, буферы TCP); firewall остаётся закрытым, только SSH"
   else
     echo "  ${B}BACKEND${R} ($BACKEND_IP): недоступен, его настройки останутся"
