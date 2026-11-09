@@ -3567,8 +3567,8 @@ set -Eeuo pipefail
 RELAY="$1"; DOMAIN="$2"; TPATH="$3"; TPSK="$4"; TOBFS="${5:-0}"
 export DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a
 case "$(uname -m)" in
-  x86_64 | amd64) ARCH=64; GOARCH=amd64 ;;
-  aarch64 | arm64) ARCH=arm64-v8a; GOARCH=arm64 ;;
+  x86_64 | amd64) ARCH=64 ;;
+  aarch64 | arm64) ARCH=arm64-v8a ;;
   *) echo "неподдерживаемая архитектура: $(uname -m)" >&2; exit 1 ;;
 esac
 need=()
@@ -3671,2249 +3671,13 @@ AmbientCapabilities=
 WantedBy=multi-user.target
 EOT
 
-# ── Go-toolchain + shadow-bridge (сам Shadow-протокол: AUTH, мультиплексирование;
-#    TLS/uTLS больше не его забота — этим занимается chain-xray выше) ──
-command -v go >/dev/null 2>&1 && go version 2>/dev/null | grep -qE 'go1\.(2[4-9]|[3-9][0-9])' || {
-  curl -fsSL --retry 3 -o "$tmp/dl.json" 'https://go.dev/dl/?mode=json'
-  read -r GOFILE GOSHA < <(python3 - "$GOARCH" "$tmp/dl.json" <<'PY'
-import json, sys
-arch, path = sys.argv[1], sys.argv[2]
-for r in json.load(open(path)):
-    if not r.get("stable"):
-        continue
-    for f in r.get("files", []):
-        if f.get("os") == "linux" and f.get("arch") == arch and f.get("kind") == "archive":
-            print(f["filename"], f["sha256"]); sys.exit(0)
-sys.exit("подходящий релиз Go не найден")
-PY
-)
-  curl -fsSL --retry 3 -o "$tmp/go.tgz" "https://go.dev/dl/$GOFILE"
-  have=$(sha256sum "$tmp/go.tgz" | awk '{print $1}')
-  [ "$have" = "$GOSHA" ] || { echo "контрольная сумма Go toolchain не совпала" >&2; exit 1; }
-  rm -rf /usr/local/go
-  tar -C /usr/local -xzf "$tmp/go.tgz"
-  ln -sf /usr/local/go/bin/go /usr/local/bin/go
-}
-src=/opt/shadow-src
-mkdir -p "$src"
-mkdir -p "$(dirname "$src"/go.mod)"
-cat > "$src"/go.mod <<'TBGO_MOD'
-module shadow
-
-go 1.24
-TBGO_MOD
-
-mkdir -p "$(dirname "$src"/mux/mux.go)"
-cat > "$src"/mux/mux.go <<'TBGO_MUXMUX'
-// Package mux — мультиплексирование потоков Shadow/1: один writer-goroutine на
-// батчинг кадров, один reader-goroutine на диспетчеризацию по stream.
-package mux
-
-import (
-	"bytes"
-	"context"
-	"crypto/rand"
-	"errors"
-	"io"
-	"sync"
-	"sync/atomic"
-	"time"
-
-	"shadow/proto"
-)
-
-const (
-	winStream = 8 << 20
-	winConn   = 32 << 20
-	batchSize = 64 << 10
-	batchWait = time.Millisecond
-	pingEvery = 25 * time.Second
-	pingMiss  = 3
-	acceptCap = 256
-	outCap    = 512
-	hsTimeout = 10 * time.Second
-
-	reasonProtocol = 0x01
-	reasonClosed   = 0x02
-)
-
-var (
-	ErrClosed      = errors.New("mux: сессия закрыта")
-	ErrStream      = errors.New("mux: поток закрыт")
-	ErrProtocol    = errors.New("mux: нарушение протокола")
-	ErrHandshake   = errors.New("mux: handshake не удался")
-	ErrPingTimeout = errors.New("mux: нет ответа на PING")
-	ErrTarget      = errors.New("mux: битый адрес цели")
-	ErrAcceptFull  = errors.New("mux: очередь accept переполнена")
-	// ErrExhausted — id кончились: сессию надо переоткрыть, потоков больше не будет.
-	ErrExhausted = errors.New("mux: исчерпано пространство stream id")
-)
-
-// Буферы фиксированных классов; в пул кладём указатели, чтобы Put не аллоцировал.
-type frameBuf [8 + proto.MaxPayload]byte
-type chunkBuf [4096]byte
-type batchBuf [batchSize]byte
-
-var (
-	pFrame = sync.Pool{New: func() any { return new(frameBuf) }}
-	pChunk = sync.Pool{New: func() any { return new(chunkBuf) }}
-	pBatch = sync.Pool{New: func() any { return new(batchBuf) }}
-)
-
-// frame — готовый кадр (заголовок + payload) в буфере из пула.
-type frame struct {
-	buf *frameBuf
-	n   int
-}
-
-type Config struct {
-	IsClient   bool
-	PSK        []byte // 32 байта
-	Exporter   []byte // 32 байта из TLS
-	WindowConn uint32 // 0 => 16 MiB
-	// PingEvery/PingMiss задают детект мёртвой сессии: молчание дольше
-	// PingEvery*PingMiss закрывает сессию. 0 => 25s/3 (75 s). Мобильному
-	// клиенту нужен туже: Doze усыпляет радио, NAT забывает поток, и
-	// «живая» сессия иначе висит чёрной ещё минуту после пробуждения.
-	PingEvery time.Duration
-	PingMiss  int
-	// AuthV2 — клиент просит AUTH v2 (X25519 + MAC сервера в AUTH_OK).
-	// Сервер принимает обе версии всегда и различает их по длине кадра,
-	// поэтому флаг нужен только клиенту: v1-клиенты продолжают работать.
-	AuthV2 bool
-	// Replay — общий на процесс кэш (ts, nonce). Без него сервер заводит
-	// свой на сессию, что бесполезно: AUTH в сессии бывает один раз.
-	Replay *proto.ReplayCache
-}
-
-type Session struct {
-	conn io.ReadWriter
-	cfg  Config
-	max  int // максимальный payload пира
-
-	mu       sync.Mutex
-	streams  map[uint16]*Stream
-	connWin  int32
-	connWait chan struct{}
-	connUsed int32
-	nextID   uint16
-
-	recvWin   int32 // наше окно приёма: сколько пир вправе держать у нас в полёте
-	recvTotal int32 // доставлено и ещё не прочитано приложением по всем потокам
-
-	out     chan frame
-	accept  chan *Stream
-	done    chan struct{}
-	writerD chan struct{}
-
-	closeOnce sync.Once
-	err       error
-
-	replay   *proto.ReplayCache
-	lastRecv atomic.Int64
-
-	// key/hasKey — сессионный ключ AUTH v2; у v1-сессий hasKey=false.
-	key    [32]byte
-	hasKey bool
-
-	pingMu    sync.Mutex
-	pingNonce [8]byte
-
-	pingEvery time.Duration // детект мёртвой сессии (cfg.PingEvery)
-	pingMiss  int           // сколько PING подряд без ответа терпим
-}
-
-// keepalive resolves the session-death detector: explicit values win, zero
-// means the package defaults (25 s x 3).
-func (c Config) keepalive() (time.Duration, int) {
-	every, miss := pingEvery, pingMiss
-	if c.PingEvery > 0 {
-		every = c.PingEvery
-	}
-	if c.PingMiss > 0 {
-		miss = c.PingMiss
-	}
-	return every, miss
-}
-
-func New(conn io.ReadWriter, cfg Config) (*Session, error) {
-	// exporter нужен только AUTH v1: v2 привязывается к X25519, а uTLS вообще
-	// не отдаёт ExportKeyingMaterial, поэтому браузерный отпечаток ходит с nil.
-	if len(cfg.PSK) != 32 || (!cfg.AuthV2 && len(cfg.Exporter) != 32) {
-		return nil, ErrHandshake
-	}
-	wc := int32(winConn)
-	if cfg.WindowConn != 0 {
-		wc = int32(cfg.WindowConn)
-	}
-	s := &Session{
-		conn:     conn,
-		cfg:      cfg,
-		max:      proto.MaxPayload,
-		streams:  make(map[uint16]*Stream),
-		connWin:  wc,
-		recvWin:  wc,
-		connWait: make(chan struct{}),
-		out:      make(chan frame, outCap),
-		accept:   make(chan *Stream, acceptCap),
-		done:     make(chan struct{}),
-		writerD:  make(chan struct{}),
-	}
-	s.pingEvery, s.pingMiss = cfg.keepalive()
-	if cfg.IsClient {
-		s.nextID = 1
-	} else {
-		s.nextID = 2
-	}
-	if err := s.handshake(); err != nil {
-		return nil, err
-	}
-	go s.writeLoop()
-	go s.readLoop()
-	go s.keepalive()
-	return s, nil
-}
-
-func (s *Session) handshake() error {
-	type deadliner interface{ SetDeadline(time.Time) error }
-	if d, ok := s.conn.(deadliner); ok {
-		d.SetDeadline(time.Now().Add(hsTimeout))
-		defer d.SetDeadline(time.Time{})
-	}
-	if s.cfg.IsClient {
-		return s.authClient()
-	}
-	return s.authServer()
-}
-
-func (s *Session) authClient() error {
-	if s.cfg.AuthV2 {
-		return s.authClientV2()
-	}
-	p, err := proto.MakeAuth(s.cfg.PSK, s.cfg.Exporter, time.Now())
-	if err != nil {
-		return err
-	}
-	if err := proto.WriteFrame(s.conn, proto.Header{Type: proto.TypeAuth}, p); err != nil {
-		return err
-	}
-	var buf [8 + proto.MaxPayload]byte
-	h, rp, err := proto.ReadFrame(s.conn, buf[:])
-	if err != nil {
-		return err
-	}
-	if h.Type != proto.TypeAuthOK {
-		return ErrHandshake
-	}
-	mp, wc, _, err := proto.ParseAuthOK(rp)
-	if err != nil {
-		return ErrHandshake
-	}
-	if mp > 0 && int(mp) < s.max {
-		s.max = int(mp)
-	}
-	if wc > 0 {
-		s.connWin = int32(wc)
-	}
-	return nil
-}
-
-// authClientV2 — AUTH v2: X25519-пара, MAC сервера в AUTH_OK. Клиент обязан
-// проверить тег до первого целевого байта: иначе MITM с доверенным сертификатом
-// выдаёт себя за сервер и видит цели.
-func (s *Session) authClientV2() error {
-	priv, err := proto.NewEphemeralKeyV2()
-	if err != nil {
-		return ErrHandshake
-	}
-	pub := proto.PublicKeyV2(priv)
-	p, err := proto.MakeAuthV2(s.cfg.PSK, pub, time.Now())
-	if err != nil {
-		return ErrHandshake
-	}
-	if err := proto.WriteFrame(s.conn, proto.Header{Type: proto.TypeAuth}, p); err != nil {
-		return err
-	}
-	var buf [8 + proto.MaxPayload]byte
-	h, rp, err := proto.ReadFrame(s.conn, buf[:])
-	if err != nil {
-		return err
-	}
-	if h.Type != proto.TypeAuthOK {
-		return ErrHandshake
-	}
-	// ts и nonce берём из своей же AUTH: сервер обязан их отразить.
-	ts, nonce, _, err := proto.VerifyAuthV2(s.cfg.PSK, p, time.Now())
-	if err != nil {
-		return ErrHandshake
-	}
-	if err := proto.VerifyAuthOKV2(s.cfg.PSK, rp, pub, nonce, ts); err != nil {
-		return ErrHandshake // сервер не доказал знание PSK
-	}
-	key, err := proto.SessionKeyV2(s.cfg.PSK, priv, rp[10:42])
-	if err != nil {
-		return ErrHandshake
-	}
-	s.key, s.hasKey = key, true
-	// Лимиты пира — из AUTH_OK v2 (12-байтового разбора у v2 нет).
-	if len(rp) >= proto.AuthOKV2Len {
-		return nil
-	}
-	return ErrHandshake
-}
-
-func (s *Session) authServer() error {
-	var buf [8 + proto.MaxPayload]byte
-	h, p, err := proto.ReadFrame(s.conn, buf[:])
-	if err != nil {
-		return err
-	}
-	// Не-AUTH кадр — это HTTP-зонд: сайт-прикрытие живёт выше mux (§4).
-	if h.Type != proto.TypeAuth {
-		return ErrHandshake
-	}
-	// Версию различаем по длине кадра: у v2 она фиксированная и не совпадает
-	// с v1, поэтому отдельное согласование не нужно и старый клиент работает.
-	if len(p) == proto.AuthV2Len {
-		return s.authServerV2(p)
-	}
-	now := time.Now()
-	if err := proto.VerifyAuth(s.cfg.PSK, s.cfg.Exporter, p, now); err != nil {
-		return err
-	}
-	ts, nonce, ok := proto.AuthPayloadTS(p)
-	if !ok {
-		return ErrHandshake
-	}
-	if s.replay == nil {
-		s.replay = proto.NewReplayCache()
-	}
-	if s.replay.Seen(now, ts, nonce) {
-		return proto.ErrAuth
-	}
-	okp := proto.MakeAuthOK(proto.MaxPayload, uint32(s.connWin), proto.CapUrgent)
-	return proto.WriteFrame(s.conn, proto.Header{Type: proto.TypeAuthOK}, okp)
-}
-
-// authServerV2 — серверная половина AUTH v2. Проверяет MAC клиента, реплей по
-// общему на процесс кэшу и отвечает AUTH_OK с собственным MAC: с этого момента
-// клиент точно знает, что говорит с владельцем PSK.
-func (s *Session) authServerV2(p []byte) error {
-	now := time.Now()
-	ts, nonce, cliPub, err := proto.VerifyAuthV2(s.cfg.PSK, p, now)
-	if err != nil {
-		return err
-	}
-	rc := s.cfg.Replay
-	if rc == nil {
-		rc = proto.NewReplayCache()
-	}
-	if rc.Seen(now, ts, nonce) {
-		return proto.ErrAuth // тот же (ts, nonce) уже был: реплей
-	}
-	priv, err := proto.NewEphemeralKeyV2()
-	if err != nil {
-		return ErrHandshake
-	}
-	srvPub := proto.PublicKeyV2(priv)
-	okp, err := proto.MakeAuthOKV2(s.cfg.PSK, cliPub, srvPub, nonce, ts)
-	if err != nil {
-		return ErrHandshake
-	}
-	if err := proto.WriteFrame(s.conn, proto.Header{Type: proto.TypeAuthOK}, okp); err != nil {
-		return err
-	}
-	key, err := proto.SessionKeyV2(s.cfg.PSK, priv, cliPub)
-	if err != nil {
-		return ErrHandshake
-	}
-	s.key, s.hasKey = key, true
-	return nil
-}
-
-// Key — сессионный ключ AUTH v2 (32 байта). ok=false для v1-сессий: там ключа нет.
-func (s *Session) Key() (key [32]byte, ok bool) { return s.key, s.hasKey }
-
-func (s *Session) Done() <-chan struct{} { return s.done }
-
-// Close мягко：шлёт CLOSE, даёт writer'у сбросить батч и закрывает соединение.
-func (s *Session) Close() error {
-	s.fail(ErrClosed, reasonClosed)
-	t := time.NewTimer(2 * time.Second)
-	defer t.Stop()
-	select {
-	case <-s.writerD:
-	case <-t.C:
-		if c, ok := s.conn.(io.Closer); ok {
-			c.Close()
-		}
-		// Без io.Closer writer может висеть в conn.Write вечно: не ждём его
-		// дольше, но и не даём Close() висеть самому.
-		select {
-		case <-s.writerD:
-		case <-time.After(500 * time.Millisecond):
-		}
-	}
-	return nil
-}
-
-func (s *Session) OpenStream(ctx context.Context, target []byte) (*Stream, error) {
-	return s.OpenStreamKind(ctx, target, false)
-}
-
-// OpenStreamKind открывает поток; udp помечает его как датаграммный (SOCKS5 UDP
-// ASSOCIATE), сервер по этой пометке релеит UDP вместо TCP.
-func (s *Session) OpenStreamKind(ctx context.Context, target []byte, udp bool) (*Stream, error) {
-	flags := uint8(proto.FlagOpen)
-	if udp {
-		flags |= proto.FlagUDP
-	}
-	return s.open(ctx, target, flags)
-}
-
-// OpenTun открывает поток IP-пакетов (режим TUN): адресного блока у него нет,
-// поэтому цель в OPEN не передаётся вовсе.
-func (s *Session) OpenTun(ctx context.Context) (*Stream, error) {
-	return s.open(ctx, nil, proto.FlagOpen|proto.FlagIP)
-}
-
-func (s *Session) open(ctx context.Context, target []byte, flags uint8) (*Stream, error) {
-	if flags&proto.FlagIP == 0 {
-		if n := proto.TargetLen(target); n < 0 || n != len(target) {
-			return nil, ErrTarget
-		}
-	}
-	s.mu.Lock()
-	if s.isClosed() {
-		s.mu.Unlock()
-		return nil, s.closedErr()
-	}
-	id := s.nextID
-	if id == 0 || id > 0x7FFF {
-		s.mu.Unlock()
-		return nil, ErrExhausted
-	}
-	s.nextID += 2
-	s.mu.Unlock()
-
-	st := s.newStream(id, append([]byte(nil), target...))
-	st.udp = flags&proto.FlagUDP != 0
-	st.ip = flags&proto.FlagIP != 0
-	if !s.register(st) {
-		return nil, ErrStream
-	}
-	h := proto.Header{Type: proto.TypeData, Flags: flags, Stream: id}
-	if _, err := st.write(ctx, h, target); err != nil {
-		s.drop(st)
-		return nil, err
-	}
-	return st, nil
-}
-
-func (s *Session) AcceptStream(ctx context.Context) (*Stream, error) {
-	select {
-	case st := <-s.accept:
-		return st, nil
-	case <-ctx.Done():
-		return nil, ctx.Err()
-	case <-s.done:
-		return nil, s.closedErr()
-	}
-}
-
-func (s *Session) newStream(id uint16, target []byte) *Stream {
-	return &Stream{
-		s:       s,
-		id:      id,
-		tgt:     target,
-		sendWin: winStream,
-		rwake:   make(chan struct{}, 1),
-		wait:    make(chan struct{}),
-	}
-}
-
-func (s *Session) register(st *Stream) bool {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.streams[st.id] != nil {
-		return false
-	}
-	s.streams[st.id] = st
-	return true
-}
-
-func (s *Session) drop(st *Stream) {
-	s.mu.Lock()
-	if s.streams[st.id] == st {
-		delete(s.streams, st.id)
-	}
-	s.mu.Unlock()
-}
-
-// onStreamClose — пир сбросил поток (CLOSE с id != 0): освобождаем его и
-// возвращаем окно соединения за недочитанные байты, иначе окно утекает и
-// новые потоки встают навсегда.
-func (s *Session) onStreamClose(id uint16, p []byte) error {
-	st := s.stream(id)
-	if st == nil {
-		return nil // поток уже закрыт — CLOSE мог прийти на гонке
-	}
-	st.resetLocal(ErrStream)
-	s.returnRecvWindow(st)
-	return nil
-}
-
-// returnRecvWindow возвращает пиру кредит за доставленные, но не прочитанные
-// байты потока: при закрытии они уже не будут прочитаны, а окно соединения
-// останется занятым навсегда.
-func (s *Session) returnRecvWindow(st *Stream) {
-	s.mu.Lock()
-	pend := st.recvPending
-	st.recvPending = 0
-	if s.recvTotal -= pend; s.recvTotal < 0 {
-		s.recvTotal = 0
-	}
-	s.mu.Unlock()
-	if pend > 0 {
-		// Асинхронно: читающий goroutine НЕ должен блокироваться на отправке,
-		// иначе забитая очередь исходящих вешает приём целиком (дедлок:
-		// writer ждёт conn.Write, reader ждёт очередь).
-		go func() {
-			wu := proto.WUPayload(0, uint32(pend))
-			s.send(proto.Header{Type: proto.TypeWU}, wu[:])
-		}()
-	}
-}
-
-// killStream рвёт один поток, не роняя сессию: окно за недочитанное пиру
-// возвращаем, CLOSE шлём неблокирующе.
-func (s *Session) killStream(st *Stream, reason byte) {
-	s.returnRecvWindow(st)
-	st.resetLocal(ErrProtocol)
-	s.trySend(proto.Header{Type: proto.TypeClose, Stream: st.id}, []byte{reason})
-}
-
-func (s *Session) stream(id uint16) *Stream {
-	s.mu.Lock()
-	st := s.streams[id]
-	s.mu.Unlock()
-	return st
-}
-
-func (s *Session) isClosed() bool {
-	select {
-	case <-s.done:
-		return true
-	default:
-		return false
-	}
-}
-
-// closedErr — ошибка закрытия; s.err читается только после получения из done.
-func (s *Session) closedErr() error {
-	select {
-	case <-s.done:
-		if s.err != nil {
-			return s.err
-		}
-		return ErrClosed
-	default:
-		return ErrClosed
-	}
-}
-
-func (s *Session) fail(err error, reason byte) {
-	s.closeOnce.Do(func() {
-		s.err = err
-		if f, e := s.build(proto.Header{Type: proto.TypeClose}, []byte{reason}); e == nil {
-			select {
-			case s.out <- f:
-			default:
-				pFrame.Put(f.buf)
-			}
-		}
-		close(s.done)
-	})
-}
-
-func (s *Session) build(h proto.Header, p []byte) (frame, error) {
-	if len(p) > proto.MaxPayload {
-		return frame{}, proto.ErrLength
-	}
-	fb := pFrame.Get().(*frameBuf)
-	h.Length = uint16(len(p))
-	h.MarshalTo(fb[:])
-	copy(fb[8:], p)
-	return frame{buf: fb, n: 8 + len(p)}, nil
-}
-
-// trySend — неблокирующая отправка: false, если очередь исходящих полна.
-func (s *Session) trySend(h proto.Header, p []byte) bool {
-	f, err := s.build(h, p)
-	if err != nil {
-		return true // некорректный кадр отбрасываем, очередь не занимаем
-	}
-	select {
-	case s.out <- f:
-		return true
-	default:
-		pFrame.Put(f.buf)
-		return false
-	}
-}
-
-func (s *Session) send(h proto.Header, p []byte) error {
-	f, err := s.build(h, p)
-	if err != nil {
-		return err
-	}
-	select {
-	case s.out <- f:
-		return nil
-	case <-s.done:
-		pFrame.Put(f.buf)
-		return s.closedErr()
-	}
-}
-
-// onWU начисляет кредит, но не больше номинала окна: delta близка к 2^32
-// иначе уводит окно в минус (Write виснет навсегда) или раздувает его выше
-// буфера пира.
-func (s *Session) onWU(id uint16, delta uint32) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if id == 0 {
-		if delta == 0 || delta > winConn {
-			return
-		}
-		s.connWin = int32(min(int64(s.connWin)+int64(delta), int64(winConn)))
-		close(s.connWait)
-		s.connWait = make(chan struct{})
-		return
-	}
-	st := s.streams[id]
-	if st == nil || delta == 0 || delta > winStream {
-		return
-	}
-	st.sendWin = int32(min(int64(st.sendWin)+int64(delta), int64(winStream)))
-	close(st.wait)
-	st.wait = make(chan struct{})
-}
-
-func (s *Session) readLoop() {
-	buf := make([]byte, 8+proto.MaxPayload)
-	for {
-		h, p, err := proto.ReadFrame(s.conn, buf)
-		if err != nil {
-			if err == io.EOF {
-				err = ErrClosed
-			}
-			s.fail(err, reasonClosed)
-			return
-		}
-		s.lastRecv.Store(time.Now().UnixNano())
-		if err := s.handle(h, p); err != nil {
-			s.fail(err, reasonProtocol)
-			return
-		}
-	}
-}
-
-func (s *Session) handle(h proto.Header, p []byte) error {
-	switch h.Type {
-	case proto.TypeData:
-		return s.onData(h, p)
-	case proto.TypeFin:
-		if st := s.stream(h.Stream); st != nil {
-			st.remoteFin()
-		}
-		return nil
-	case proto.TypeWU:
-		id, delta, ok := proto.ParseWU(p)
-		if !ok {
-			return ErrProtocol
-		}
-		s.onWU(id, delta)
-		return nil
-	case proto.TypePing:
-		if len(p) != 8 {
-			return ErrProtocol
-		}
-		s.onPing(p)
-		return nil
-	case proto.TypeClose:
-		if h.Stream != 0 {
-			return s.onStreamClose(h.Stream, p)
-		}
-		s.fail(ErrClosed, reasonClosed)
-		return nil
-	default:
-		// PAD, MIG, ACK, AUTH/AUTH_OK после handshake — игнор
-		return nil
-	}
-}
-
-func (s *Session) onPing(p []byte) {
-	s.pingMu.Lock()
-	ours := bytes.Equal(p, s.pingNonce[:])
-	s.pingMu.Unlock()
-	if ours {
-		return
-	}
-	s.send(proto.Header{Type: proto.TypePing}, p)
-}
-
-func (s *Session) onData(h proto.Header, p []byte) error {
-	if h.Stream == 0 {
-		return ErrProtocol
-	}
-	fin := h.Flags&proto.FlagFin != 0
-	if h.Flags&proto.FlagOpen != 0 {
-		if (h.Stream%2 == 0) != s.cfg.IsClient {
-			return ErrProtocol // чужая чётность (§3)
-		}
-		n := 0
-		if h.Flags&proto.FlagIP == 0 { // у потока IP-пакетов адресного блока нет
-			if n = proto.TargetLen(p); n < 0 || n != len(p) {
-				return ErrProtocol
-			}
-		}
-		st := s.newStream(h.Stream, append([]byte(nil), p[:n]...))
-		st.udp = h.Flags&proto.FlagUDP != 0
-		st.ip = h.Flags&proto.FlagIP != 0
-		if !s.register(st) {
-			// Дубль OPEN: рвём только этот id, сессию не трогаем.
-			if old := s.stream(h.Stream); old != nil {
-				s.killStream(old, reasonProtocol)
-			}
-			return nil
-		}
-		select {
-		case s.accept <- st:
-		default:
-			// Очередь accept полна: отказываем одному потоку, а не всей
-			// сессии — иначе 400 OPEN рвут все живые туннели.
-			s.killStream(st, reasonProtocol)
-			return nil
-		}
-		if err := st.deliver(p[n:], fin); err != nil {
-			if err == ErrProtocol { // превышено окно приёма: валим сессию
-				return err
-			}
-			if err == errAfterFin {
-				s.killStream(st, reasonProtocol)
-			}
-		}
-		return nil
-	}
-	st := s.stream(h.Stream)
-	if st == nil {
-		// Поток уже сброшен (CLOSE в пути): кадры, отправленные до CLOSE,
-		// просто отбрасываем — но окно соединения за них возвращаем, иначе
-		// кредит пира тает на каждом Reset. Это не нарушение протокола,
-		// иначе сессия падала бы после каждого Reset.
-		if n := len(p); n > 0 {
-			wu := proto.WUPayload(0, uint32(n))
-			s.trySend(proto.Header{Type: proto.TypeWU}, wu[:])
-		}
-		return nil
-	}
-	if err := st.deliver(p, fin); err != nil {
-		switch err {
-		case ErrProtocol: // превышено окно приёма: пир нарушил протокол
-			return err
-		case errAfterFin: // данные после чистого FIN: виноват один поток
-			s.killStream(st, reasonProtocol)
-		}
-	}
-	return nil
-}
-
-func (s *Session) writeLoop() {
-	defer close(s.writerD)
-	bp := pBatch.Get().(*batchBuf)
-	batch := bp[:0]
-	t := time.NewTimer(time.Hour)
-	t.Stop()
-	var tc <-chan time.Time
-
-	flush := func() error {
-		if len(batch) == 0 {
-			return nil
-		}
-		if _, err := s.conn.Write(batch); err != nil {
-			s.fail(err, reasonClosed)
-			return err
-		}
-		batch = batch[:0]
-		return nil
-	}
-	push := func(f frame) error {
-		if len(batch)+f.n > cap(batch) {
-			if err := flush(); err != nil {
-				pFrame.Put(f.buf)
-				return err
-			}
-		}
-		batch = append(batch, f.buf[:f.n]...)
-		pFrame.Put(f.buf)
-		return nil
-	}
-	stopTimer := func() {
-		if tc != nil {
-			if !t.Stop() {
-				select {
-				case <-t.C:
-				default:
-				}
-			}
-			tc = nil
-		}
-	}
-
-loop:
-	for {
-		select {
-		case f := <-s.out:
-			urgent := f.buf[1]&proto.FlagUrgent != 0
-			if push(f) != nil {
-				break loop
-			}
-			if urgent || len(batch) >= batchSize {
-				stopTimer()
-				if flush() != nil {
-					break loop
-				}
-				continue
-			}
-			if tc == nil {
-				t.Reset(batchWait)
-				tc = t.C
-			}
-		case <-tc:
-			tc = nil
-			if flush() != nil {
-				break loop
-			}
-		case <-s.done:
-			for {
-				select {
-				case f := <-s.out:
-					if push(f) != nil {
-						break loop
-					}
-				default:
-					flush()
-					break loop
-				}
-			}
-		}
-	}
-	stopTimer()
-	pBatch.Put(bp)
-	// соединение закрывает только writer: reader разблокируется на ошибке чтения
-	if c, ok := s.conn.(io.Closer); ok {
-		c.Close()
-	}
-}
-
-func (s *Session) keepalive() {
-	t := time.NewTimer(s.pingEvery)
-	defer t.Stop()
-	prev := s.lastRecv.Load()
-	misses := 0
-	for {
-		select {
-		case <-s.done:
-			return
-		case <-t.C:
-		}
-		cur := s.lastRecv.Load()
-		if cur == prev {
-			misses++
-			if misses >= s.pingMiss {
-				s.fail(ErrPingTimeout, reasonProtocol)
-				return
-			}
-			s.ping()
-		} else {
-			misses = 0
-		}
-		prev = cur
-		t.Reset(s.pingEvery)
-	}
-}
-
-func (s *Session) ping() {
-	var n [8]byte
-	rand.Read(n[:])
-	s.pingMu.Lock()
-	s.pingNonce = n
-	s.pingMu.Unlock()
-	s.send(proto.Header{Type: proto.TypePing}, n[:])
-}
-TBGO_MUXMUX
-
-mkdir -p "$(dirname "$src"/mux/stream.go)"
-cat > "$src"/mux/stream.go <<'TBGO_MUXSTREAM'
-package mux
-
-import (
-	"context"
-	"errors"
-	"io"
-	"os"
-	"sync"
-	"sync/atomic"
-	"time"
-
-	"shadow/proto"
-)
-
-type recvChunk struct {
-	buf *chunkBuf
-	n   int // записано
-	off int // прочитано
-}
-
-type Stream struct {
-	s   *Session
-	id  uint16
-	tgt []byte
-	udp bool // датаграммный поток (SOCKS5 UDP ASSOCIATE)
-	ip  bool // поток IP-пакетов (режим TUN)
-
-	rmu   sync.Mutex
-	rq    []recvChunk
-	rhead int
-	rerr  error
-	rfin  bool
-	rwake chan struct{} // семафор: 1 токен = «проверь очередь»
-
-	// под rmu: дедлайн чтения. Срабатывая, он кидает токен в rwake — тот же
-	// семафор, что и у данных, поэтому select в Read не подорожал.
-	rdl    time.Time
-	rdlGen uint64 // поколение: таймер прошлого поколения не стреляет
-	rdlTmr *time.Timer
-
-	// под s.mu
-	sendWin     int32
-	recvUsed    int32
-	recvPending int32 // доставлено приложению, но ещё не прочитано
-	wait        chan struct{}
-
-	sfin   atomic.Bool
-	urgent atomic.Bool
-}
-
-// Target — адресный блок §3, с которым поток открыт.
-func (st *Stream) Target() []byte { return st.tgt }
-
-// IsUDP — поток датаграммный (открыт с proto.FlagUDP).
-func (st *Stream) IsUDP() bool { return st.udp }
-
-// IsIP — поток несёт IP-пакеты (открыт с proto.FlagIP, режим TUN).
-func (st *Stream) IsIP() bool { return st.ip }
-
-func (st *Stream) Read(p []byte) (int, error) {
-	if len(p) == 0 {
-		return 0, nil
-	}
-	st.rmu.Lock()
-	for {
-		if st.rhead < len(st.rq) {
-			c := &st.rq[st.rhead]
-			n := copy(p, c.buf[c.off:c.n])
-			if n > 0 {
-				c.off += n
-				var done *chunkBuf
-				if c.off == c.n {
-					done = c.buf
-					st.rq[st.rhead] = recvChunk{}
-					st.rhead++
-					st.compact()
-				}
-				drained := st.rhead == len(st.rq)
-				st.rmu.Unlock()
-				if done != nil {
-					pChunk.Put(done)
-				}
-				st.consumed(n, drained)
-				return n, nil
-			}
-		}
-		if st.rerr != nil {
-			err := st.rerr
-			st.rmu.Unlock()
-			return 0, err
-		}
-		// Истёкший дедлайн проверяем до блокировки: данные из очереди важнее.
-		expired := st.readExpired()
-		st.rmu.Unlock()
-		if expired {
-			return 0, os.ErrDeadlineExceeded
-		}
-		select {
-		case <-st.rwake:
-		case <-st.s.done:
-			return 0, st.s.closedErr()
-		}
-		st.rmu.Lock()
-	}
-}
-
-// readExpired (под rmu) сообщает, что дедлайн чтения истёк, и снимает его:
-// следующий Read снова блокируется, а не спотыкается о мёртвый дедлайн.
-func (st *Stream) readExpired() bool {
-	if st.rdl.IsZero() || st.rdl.After(time.Now()) {
-		return false
-	}
-	st.rdl = time.Time{}
-	if st.rdlTmr != nil {
-		st.rdlTmr.Stop()
-		st.rdlTmr = nil
-	}
-	return true
-}
-
-// kick (под rmu) будит блокирующий Read: данные пришли или дедлайн истёк.
-func (st *Stream) kick() {
-	select {
-	case st.rwake <- struct{}{}:
-	default:
-	}
-}
-
-// SetReadDeadline взводит дедлайн чтения: по его истечении блокирующий Read
-// вернёт os.ErrDeadlineExceeded. Нулевое время снимает дедлайн, повторный
-// вызов заменяет прежний таймер.
-func (st *Stream) SetReadDeadline(t time.Time) error {
-	st.rmu.Lock()
-	defer st.rmu.Unlock()
-	if st.rdlTmr != nil {
-		st.rdlTmr.Stop()
-		st.rdlTmr = nil
-	}
-	st.rdl = t
-	st.rdlGen++
-	switch d := time.Until(t); {
-	case t.IsZero():
-	case d <= 0:
-		st.kick()
-	default:
-		gen := st.rdlGen
-		st.rdlTmr = time.AfterFunc(d, func() {
-			st.rmu.Lock()
-			if st.rdlGen == gen { // таймер своего поколения: чужой не стреляет
-				st.rdlTmr = nil
-				st.kick()
-			}
-			st.rmu.Unlock()
-		})
-	}
-	return nil
-}
-
-// WriteContext — Write, у которого ожидание окна отменяется ctx.
-func (st *Stream) WriteContext(ctx context.Context, p []byte) (int, error) {
-	if len(p) == 0 {
-		return 0, nil
-	}
-	if st.sfin.Load() {
-		return 0, ErrStream
-	}
-	h := proto.Header{Type: proto.TypeData, Stream: st.id}
-	if st.urgent.Load() {
-		h.Flags = proto.FlagUrgent
-	}
-	return st.write(ctx, h, p)
-}
-
-func (st *Stream) Write(p []byte) (int, error) {
-	return st.WriteContext(context.Background(), p)
-}
-
-// Close — полузакрытие: FIN в свою сторону; поток освобождается после FIN пира.
-func (st *Stream) Close() error {
-	if st.sfin.Swap(true) {
-		return nil
-	}
-	s := st.s
-	s.mu.Lock()
-	close(st.wait)
-	st.wait = make(chan struct{})
-	s.mu.Unlock()
-	err := s.send(proto.Header{Type: proto.TypeFin, Stream: st.id}, nil)
-	st.maybeFree()
-	return err
-}
-
-// Reset рвёт поток: CLOSE пиру + локальная очистка. В отличие от Close (FIN),
-// говорит пиру «перестань слать», поэтому освобождает окно соединения.
-func (st *Stream) Reset() error {
-	s := st.s
-	// Байты, доставленные нам, но не прочитанные приложением, надо вернуть
-	// пиру как окно — иначе его connWin утекает и он замолкает навсегда.
-	err := s.send(proto.Header{Type: proto.TypeClose, Stream: st.id}, []byte{reasonClosed})
-	st.resetLocal(ErrStream)
-	s.returnRecvWindow(st)
-	return err
-}
-
-// resetLocal помечает поток закрытым с обеих сторон и будит читателей/писателей.
-func (st *Stream) resetLocal(err error) {
-	s := st.s
-	st.rmu.Lock()
-	if st.rerr == nil {
-		st.rerr = err
-	}
-	st.rfin = true
-	st.rmu.Unlock()
-	st.sfin.Store(true) // писатели выходят из reserve с ErrStream
-	s.mu.Lock()
-	close(st.wait)
-	st.wait = make(chan struct{})
-	s.mu.Unlock()
-	st.kick()
-	s.drop(st)
-}
-
-// SetUrgent ставит URGENT на исходящие кадры потока.
-func (st *Stream) SetUrgent(on bool) { st.urgent.Store(on) }
-
-func (st *Stream) write(ctx context.Context, h proto.Header, p []byte) (int, error) {
-	written := 0
-	for {
-		n, err := st.reserve(ctx, len(p))
-		if err != nil {
-			return written, err
-		}
-		h.Length = uint16(n)
-		if err := st.s.send(h, p[:n]); err != nil {
-			st.release(n)
-			return written, err
-		}
-		written += n
-		p = p[n:]
-		if len(p) == 0 {
-			return written, nil
-		}
-	}
-}
-
-// reserve списывает окно и ждёт, если оно кончилось.
-func (st *Stream) reserve(ctx context.Context, max int) (int, error) {
-	s := st.s
-	for {
-		s.mu.Lock()
-		if st.sfin.Load() {
-			s.mu.Unlock()
-			return 0, ErrStream
-		}
-		// Сессия могла умереть: кредит выдавать нельзя, иначе Write вернёт nil,
-		// а кадр уйдёт в очередь мёртвого writer'а (данные потеряны молча).
-		if s.isClosed() {
-			s.mu.Unlock()
-			return 0, s.closedErr()
-		}
-		// Кадр без полезной нагрузки окно не тратит — иначе write() с пустым
-		// payload ждал бы кредит вечно (OPEN потока IP-пакетов, FIN).
-		if max == 0 {
-			s.mu.Unlock()
-			return 0, nil
-		}
-		if st.sendWin < 0 {
-			st.sendWin = 0
-		}
-		if s.connWin < 0 {
-			s.connWin = 0
-		}
-		n := min(max, s.max)
-		if int32(n) > st.sendWin {
-			n = int(st.sendWin)
-		}
-		if int32(n) > s.connWin {
-			n = int(s.connWin)
-		}
-		if n > 0 {
-			st.sendWin -= int32(n)
-			s.connWin -= int32(n)
-			s.mu.Unlock()
-			return n, nil
-		}
-		ch, cch := st.wait, s.connWait
-		s.mu.Unlock()
-		select {
-		case <-ch:
-		case <-cch:
-		case <-ctx.Done():
-			return 0, ctx.Err()
-		case <-s.done:
-			return 0, s.closedErr()
-		}
-	}
-}
-
-func (st *Stream) release(n int) {
-	s := st.s
-	s.mu.Lock()
-	st.sendWin += int32(n)
-	s.connWin += int32(n)
-	s.mu.Unlock()
-}
-
-// consumed возвращает окно пиру через WU при 1/8 расхода (§5).
-func (st *Stream) consumed(n int, drained bool) {
-	s := st.s
-	s.mu.Lock()
-	st.recvUsed += int32(n)
-	st.recvPending -= int32(n)
-	if st.recvPending < 0 {
-		st.recvPending = 0
-	}
-	if s.recvTotal -= int32(n); s.recvTotal < 0 {
-		s.recvTotal = 0
-	}
-	s.connUsed += int32(n)
-	var sDelta, cDelta uint32
-	// Порог 1/8 окна; при опустевшей очереди хвост отдаём раньше, но не мельче
-	// 1/64 окна — иначе на каждый Read уходит кадр WU и трафик растёт впустую.
-	tailMin := int32(winStream / 64)
-	if st.recvUsed >= winStream/8 || (drained && st.recvUsed >= tailMin) {
-		sDelta, st.recvUsed = uint32(st.recvUsed), 0
-	}
-	if s.connUsed >= winConn/8 || (drained && s.connUsed >= tailMin) {
-		cDelta, s.connUsed = uint32(s.connUsed), 0
-	}
-	s.mu.Unlock()
-
-	// consumed вызывается из Read: блокирующий send здесь останавливает приём
-	// целиком. Если очередь полна — возвращаем кредит в счётчики и отдадим
-	// при следующем чтении.
-	if sDelta > 0 {
-		p := proto.WUPayload(st.id, sDelta)
-		if !s.trySend(proto.Header{Type: proto.TypeWU}, p[:]) {
-			s.mu.Lock()
-			st.recvUsed += int32(sDelta)
-			s.mu.Unlock()
-		}
-	}
-	if cDelta > 0 {
-		p := proto.WUPayload(0, cDelta)
-		if !s.trySend(proto.Header{Type: proto.TypeWU}, p[:]) {
-			s.mu.Lock()
-			s.connUsed += int32(cDelta)
-			s.mu.Unlock()
-		}
-	}
-}
-
-// errAfterFin — данные после чистого FIN: рвём поток, но не сессию.
-var errAfterFin = errors.New("mux: данные после FIN")
-
-// deliver кладёт данные в очередь приёма; вызывается только reader'ом.
-func (st *Stream) deliver(p []byte, fin bool) error {
-	st.rmu.Lock()
-	if st.rerr != nil {
-		err := st.rerr
-		st.rmu.Unlock()
-		if err == ErrStream {
-			return ErrStream // поток сброшен нами: кадр в пути — не нарушение
-		}
-		return errAfterFin // данные после чистого FIN — виноват только поток
-	}
-	if n := len(p); n > 0 {
-		// под s.mu и ДО push: пир, игнорирующий окна, не должен набить
-		// очередь приёма целиком (иначе одна сессия кладёт сервер по памяти).
-		s := st.s
-		s.mu.Lock()
-		if st.recvPending+int32(n) > winStream || s.recvTotal+int32(n) > s.recvWin {
-			s.mu.Unlock()
-			st.rmu.Unlock()
-			return ErrProtocol
-		}
-		st.recvPending += int32(n)
-		s.recvTotal += int32(n)
-		s.mu.Unlock()
-		st.push(p)
-	}
-	if fin {
-		st.rfin = true
-		st.rerr = io.EOF
-	}
-	st.kick()
-	st.rmu.Unlock()
-	if fin {
-		st.maybeFree()
-	}
-	return nil
-}
-
-func (st *Stream) push(p []byte) {
-	if n := len(st.rq); n > st.rhead {
-		c := &st.rq[n-1]
-		if len(c.buf)-c.n >= len(p) {
-			copy(c.buf[c.n:], p)
-			c.n += len(p)
-			return
-		}
-	}
-	cb := pChunk.Get().(*chunkBuf)
-	copy(cb[:], p)
-	st.rq = append(st.rq, recvChunk{buf: cb, n: len(p)})
-}
-
-func (st *Stream) compact() {
-	if st.rhead > 16 && st.rhead*2 >= len(st.rq) {
-		n := copy(st.rq, st.rq[st.rhead:])
-		st.rq = st.rq[:n]
-		st.rhead = 0
-	}
-}
-
-func (st *Stream) remoteFin() {
-	st.rmu.Lock()
-	if st.rfin {
-		st.rmu.Unlock()
-		return
-	}
-	st.rfin = true
-	if st.rerr == nil {
-		st.rerr = io.EOF
-	}
-	st.kick()
-	st.rmu.Unlock()
-	st.maybeFree()
-}
-
-func (st *Stream) maybeFree() {
-	st.rmu.Lock()
-	both := st.rfin && st.sfin.Load()
-	st.rmu.Unlock()
-	if both {
-		// Поток уходит из таблицы: недочитанный кредит обязан вернуться пиру,
-		// иначе connWin тает и новые потоки встают навсегда.
-		st.s.returnRecvWindow(st)
-		st.s.drop(st)
-	}
-}
-TBGO_MUXSTREAM
-
-mkdir -p "$(dirname "$src"/proto/auth.go)"
-cat > "$src"/proto/auth.go <<'TBGO_AUTH'
-package proto
-
-import (
-	"container/list"
-	"crypto/ecdh"
-	"crypto/hkdf"
-	"crypto/hmac"
-	"crypto/rand"
-	"crypto/sha256"
-	"encoding/binary"
-	"errors"
-	"sync"
-	"time"
-)
-
-const (
-	AuthVersion = 1
-	authLen     = 50
-	AuthSkew    = 120 // секунд, §4
-
-	// KeyLen — длина PSK и любого ключевого материала протокола.
-	KeyLen = 32
-
-	// caps в AUTH_OK
-	CapUrgent   = 1 << 0
-	CapDatagram = 1 << 1
-	CapWeb      = 1 << 2
-)
-
-var (
-	ErrAuth   = errors.New("proto: AUTH отклонён")
-	ErrAuthOK = errors.New("proto: AUTH_OK битый")
-	authLabel = []byte("SHADOW1-AUTH")
-)
-
-// AuthTag = HMAC-SHA256(psk, "SHADOW1-AUTH" || exporter || ver || ts || nonce)[32].
-// ver и ts — big-endian, как в заголовке кадра.
-// Контракт: len(psk) == len(exporter) == KeyLen. Длины проверяют MakeAuth и
-// VerifyAuth; сам AuthTag копирует в 32-байтовый слот сообщения и ошибку не
-// возвращает — вызывать его напрямую с другими длинами нельзя.
-func AuthTag(psk, exporter []byte, ver uint16, ts uint64, nonce []byte) [32]byte {
-	var msg [9 + KeyLen + 2 + 8 + 8]byte
-	var nb [8]byte
-	copy(nb[:], nonce)
-	n := copy(msg[:], authLabel)
-	n += copy(msg[n:], exporter[:min(len(exporter), KeyLen)])
-	binary.BigEndian.PutUint16(msg[n:], ver)
-	binary.BigEndian.PutUint64(msg[n+2:], ts)
-	copy(msg[n+10:], nb[:])
-
-	m := hmac.New(sha256.New, psk)
-	m.Write(msg[:n+18])
-	var tag [32]byte
-	copy(tag[:], m.Sum(nil))
-	return tag
-}
-
-// skewOK — |now - ts| <= AuthSkew без знаковой арифметики: разность двух uint64
-// определена по модулю 2^64, поэтому ts = now+2^63 даёт разницу 2^63 > AuthSkew,
-// а не MinInt64 с последующим -d (старый вариант такую метку пропускал).
-func skewOK(now time.Time, ts uint64) bool {
-	n := uint64(now.Unix())
-	d := n - ts
-	if ts > n {
-		d = ts - n
-	}
-	return d <= AuthSkew
-}
-
-// MakeAuth собирает 50-байтовый payload AUTH с текущим ts и случайным nonce.
-func MakeAuth(psk, exporter []byte, now time.Time) ([]byte, error) {
-	if len(psk) != KeyLen || len(exporter) != KeyLen {
-		return nil, ErrAuth
-	}
-	b := make([]byte, authLen)
-	binary.BigEndian.PutUint16(b[0:], AuthVersion)
-	ts := uint64(now.Unix())
-	binary.BigEndian.PutUint64(b[2:], ts)
-	if _, err := rand.Read(b[10:18]); err != nil {
-		return nil, err
-	}
-	tag := AuthTag(psk, exporter, AuthVersion, ts, b[10:18])
-	copy(b[18:], tag[:])
-	return b, nil
-}
-
-// VerifyAuth проверяет ver, |now-ts| <= 120 c и тег (constant-time). Replay — ReplayCache.
-func VerifyAuth(psk, exporter, payload []byte, now time.Time) error {
-	if len(psk) != KeyLen || len(exporter) != KeyLen {
-		return ErrAuth
-	}
-	if len(payload) != authLen {
-		return ErrAuth
-	}
-	if binary.BigEndian.Uint16(payload[0:]) != AuthVersion {
-		return ErrAuth
-	}
-	ts := binary.BigEndian.Uint64(payload[2:])
-	if !skewOK(now, ts) {
-		return ErrAuth
-	}
-	want := AuthTag(psk, exporter, AuthVersion, ts, payload[10:18])
-	if !hmac.Equal(want[:], payload[18:50]) {
-		return ErrAuth
-	}
-	return nil
-}
-
-// AuthPayloadTS разбирает ts и nonce из payload AUTH (уже проверенного VerifyAuth).
-func AuthPayloadTS(payload []byte) (ts uint64, nonce []byte, ok bool) {
-	if len(payload) != authLen {
-		return 0, nil, false
-	}
-	return binary.BigEndian.Uint64(payload[2:]), payload[10:18], true
-}
-
-// AUTH_OK: ver u16, maxPayload u16, windowConn u32, caps u32.
-func MakeAuthOK(maxPayload uint16, windowConn, caps uint32) []byte {
-	b := make([]byte, 12)
-	binary.BigEndian.PutUint16(b[0:], AuthVersion)
-	binary.BigEndian.PutUint16(b[2:], maxPayload)
-	binary.BigEndian.PutUint32(b[4:], windowConn)
-	binary.BigEndian.PutUint32(b[8:], caps)
-	return b
-}
-
-func ParseAuthOK(p []byte) (maxPayload uint16, windowConn, caps uint32, err error) {
-	if len(p) != 12 || binary.BigEndian.Uint16(p[0:]) != AuthVersion {
-		return 0, 0, 0, ErrAuthOK
-	}
-	return binary.BigEndian.Uint16(p[2:]), binary.BigEndian.Uint32(p[4:]), binary.BigEndian.Uint32(p[8:]), nil
-}
-
-const (
-	replayTTL = 5 * time.Minute
-	replayCap = 10000
-)
-
-type replayKey struct {
-	ts    uint64
-	nonce [8]byte
-}
-
-type replayEntry struct {
-	k  replayKey
-	at time.Time
-}
-
-// ReplayCache — LRU на (ts, nonce) с TTL 5 мин и ёмкостью 10000 (§4).
-// Безопасен для конкурентного использования: живёт столько же, сколько сервер,
-// и передаётся всем сессиям. Кэш на одну сессию бесполезен — AUTH в сессии
-// бывает ровно один раз, повторить его негде.
-type ReplayCache struct {
-	mu  sync.Mutex
-	ll  *list.List
-	m   map[replayKey]*list.Element
-	ttl time.Duration
-	cap int
-}
-
-// NewReplayCache — кэш с параметрами по умолчанию (5 мин, 10000).
-func NewReplayCache() *ReplayCache {
-	return NewReplayCacheWith(replayTTL, replayCap)
-}
-
-// NewReplayCacheWith — кэш с явными TTL и ёмкостью; <= 0 означает дефолт.
-func NewReplayCacheWith(ttl time.Duration, capacity int) *ReplayCache {
-	if ttl <= 0 {
-		ttl = replayTTL
-	}
-	if capacity <= 0 {
-		capacity = replayCap
-	}
-	return &ReplayCache{ll: list.New(), m: make(map[replayKey]*list.Element, 64), ttl: ttl, cap: capacity}
-}
-
-// Seen сообщает, что (ts, nonce) уже видели, и запоминает пару.
-func (c *ReplayCache) Seen(now time.Time, ts uint64, nonce []byte) bool {
-	if len(nonce) < 8 {
-		return true
-	}
-	var k replayKey
-	k.ts = ts
-	copy(k.nonce[:], nonce)
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if c.ll == nil { // нулевое значение: всё считаем реплеем, паниковать незачем
-		return true
-	}
-	// вытесняем с головы: просроченные и лишние (порядок вставки)
-	for f := c.ll.Front(); f != nil; f = c.ll.Front() {
-		e := f.Value.(replayEntry)
-		if len(c.m) < c.cap && now.Sub(e.at) < c.ttl {
-			break
-		}
-		c.ll.Remove(f)
-		delete(c.m, e.k)
-	}
-	if e, ok := c.m[k]; ok {
-		c.ll.MoveToBack(e)
-		return true
-	}
-	c.m[k] = c.ll.PushBack(replayEntry{k: k, at: now})
-	return false
-}
-
-// --- AUTH v2: X25519 + MAC в обе стороны (docs/13-plan-v2.md §3) ---
-//
-// Зачем: в v1 сервер доказывает знание PSK только самим фактом AUTH_OK, поэтому
-// MITM с доверенным клиенту сертификатом выдаёт себя за сервер. В v2 сервер
-// обязан прислать MAC, клиент его проверяет, а привязка к соединению идёт через
-// ECDH, а не через TLS-exporter: exporter недоступен под uTLS (браузерные
-// ClientHello включают renegotiation_info, см. 12-security-audit.md §5).
-
-const (
-	// AuthVersionV2 — версия AUTH с X25519 и MAC в AUTH_OK.
-	AuthVersionV2 = 2
-	// PubKeyLen — длина публичного ключа X25519.
-	PubKeyLen = KeyLen
-	// NonceLen — длина nonce в AUTH/AUTH_OK.
-	NonceLen = 8
-
-	authV2Len   = 2 + 8 + NonceLen + PubKeyLen + 32 // 82
-	authOKV2Len = 2 + NonceLen + PubKeyLen + 32     // 74
-
-	// AuthV2Len и AuthOKV2Len — длины кадров на проводе: по ним сервер
-	// отличает AUTH v2 от v1 без отдельного согласования версии.
-	AuthV2Len   = authV2Len
-	AuthOKV2Len = authOKV2Len
-)
-
-var (
-	ErrAuthV2     = errors.New("proto: AUTH v2 отклонён")
-	authV2Label   = []byte("SHADOW1-AUTH-V2")
-	authOKV2Label = []byte("SHADOW1-AUTH-OK-V2")
-	sessionV2Info = "SHADOW1-SESSION-V2"
-)
-
-// NewEphemeralKeyV2 — эфемерная пара X25519 на одну сессию.
-func NewEphemeralKeyV2() (*ecdh.PrivateKey, error) {
-	return ecdh.X25519().GenerateKey(rand.Reader)
-}
-
-// PublicKeyV2 — 32 байта публичного ключа для провода.
-func PublicKeyV2(k *ecdh.PrivateKey) []byte { return k.PublicKey().Bytes() }
-
-// MakeAuthV2 собирает 82-байтовый AUTH v2:
-// ver u16 | ts u64 | nonce 8 | clientPub 32 | tag 32,
-// tag = HMAC-SHA256(psk, "SHADOW1-AUTH-V2" ‖ ver ‖ ts ‖ nonce ‖ clientPub).
-func MakeAuthV2(psk, clientPub []byte, now time.Time) ([]byte, error) {
-	return makeAuthV2At(psk, clientPub, now, rand.Read)
-}
-
-// makeAuthV2At — шов для детерминированного nonce в тестах.
-func makeAuthV2At(psk, clientPub []byte, now time.Time, rnd func([]byte) (int, error)) ([]byte, error) {
-	if len(psk) != KeyLen || len(clientPub) != PubKeyLen {
-		return nil, ErrAuthV2
-	}
-	b := make([]byte, authV2Len)
-	binary.BigEndian.PutUint16(b[0:], AuthVersionV2)
-	binary.BigEndian.PutUint64(b[2:], uint64(now.Unix()))
-	if _, err := rnd(b[10:18]); err != nil {
-		return nil, err
-	}
-	copy(b[18:50], clientPub)
-	tag := authV2Tag(psk, b[0:2], b[2:10], b[10:18], b[18:50])
-	copy(b[50:], tag[:])
-	return b, nil
-}
-
-// VerifyAuthV2 проверяет ver=2, окно ts и тег (constant-time) и возвращает
-// разобранные ts, nonce и clientPub (копии — payload можно освобождать).
-func VerifyAuthV2(psk, payload []byte, now time.Time) (ts uint64, nonce, clientPub []byte, err error) {
-	if len(psk) != KeyLen || len(payload) != authV2Len {
-		return 0, nil, nil, ErrAuthV2
-	}
-	if binary.BigEndian.Uint16(payload[0:]) != AuthVersionV2 {
-		return 0, nil, nil, ErrAuthV2
-	}
-	ts = binary.BigEndian.Uint64(payload[2:])
-	if !skewOK(now, ts) {
-		return 0, nil, nil, ErrAuthV2
-	}
-	want := authV2Tag(psk, payload[0:2], payload[2:10], payload[10:18], payload[18:50])
-	if !hmac.Equal(want[:], payload[50:82]) {
-		return 0, nil, nil, ErrAuthV2
-	}
-	nonce = append([]byte(nil), payload[10:18]...)
-	clientPub = append([]byte(nil), payload[18:50]...)
-	return ts, nonce, clientPub, nil
-}
-
-// authV2Tag — HMAC по фиксированной раскладке: варьируемых длин нет, поэтому
-// усечение/склейка полей невозможны.
-func authV2Tag(psk, ver, ts, nonce, pub []byte) [32]byte {
-	m := hmac.New(sha256.New, psk)
-	m.Write(authV2Label)
-	m.Write(ver)
-	m.Write(ts)
-	m.Write(nonce)
-	m.Write(pub)
-	var tag [32]byte
-	copy(tag[:], m.Sum(nil))
-	return tag
-}
-
-// MakeAuthOKV2 собирает 74-байтовый AUTH_OK v2:
-// ver u16 | nonce 8 (эхо из AUTH) | serverPub 32 | tag 32,
-// tag = HMAC-SHA256(psk, "SHADOW1-AUTH-OK-V2" ‖ clientPub ‖ serverPub ‖ ts ‖ nonce).
-// Именно этот MAC не даёт MITM выдать себя за сервер.
-func MakeAuthOKV2(psk, clientPub, serverPub, nonce []byte, ts uint64) ([]byte, error) {
-	if len(psk) != KeyLen || len(clientPub) != PubKeyLen || len(serverPub) != PubKeyLen || len(nonce) != NonceLen {
-		return nil, ErrAuthV2
-	}
-	b := make([]byte, authOKV2Len)
-	binary.BigEndian.PutUint16(b[0:], AuthVersionV2)
-	copy(b[2:10], nonce)
-	copy(b[10:42], serverPub)
-	var tsb [8]byte
-	binary.BigEndian.PutUint64(tsb[:], ts)
-	m := hmac.New(sha256.New, psk)
-	m.Write(authOKV2Label)
-	m.Write(clientPub)
-	m.Write(serverPub)
-	m.Write(tsb[:])
-	m.Write(nonce)
-	copy(b[42:], m.Sum(nil))
-	return b, nil
-}
-
-// VerifyAuthOKV2 проверяет AUTH_OK v2 против того, что клиент сам отправил в AUTH
-// (clientPub, ts, nonce). Несовпадение nonce-эха или тега — ErrAuthV2.
-func VerifyAuthOKV2(psk, payload, clientPub, nonce []byte, ts uint64) error {
-	if len(psk) != KeyLen || len(payload) != authOKV2Len || len(clientPub) != PubKeyLen || len(nonce) != NonceLen {
-		return ErrAuthV2
-	}
-	if binary.BigEndian.Uint16(payload[0:]) != AuthVersionV2 {
-		return ErrAuthV2
-	}
-	if !hmac.Equal(payload[2:10], nonce) {
-		return ErrAuthV2
-	}
-	var tsb [8]byte
-	binary.BigEndian.PutUint64(tsb[:], ts)
-	m := hmac.New(sha256.New, psk)
-	m.Write(authOKV2Label)
-	m.Write(clientPub)
-	m.Write(payload[10:42])
-	m.Write(tsb[:])
-	m.Write(nonce)
-	if !hmac.Equal(m.Sum(nil), payload[42:74]) {
-		return ErrAuthV2
-	}
-	return nil
-}
-
-// SessionKeyV2 — сессионный ключ: X25519(свой приватный, публичный пира) →
-// HKDF-SHA256(salt=psk, info="SHADOW1-SESSION-V2") → 32 байта.
-// Знают только двое участников — это и есть привязка AUTH к соединению.
-func SessionKeyV2(psk []byte, priv *ecdh.PrivateKey, peerPub []byte) ([32]byte, error) {
-	var out [32]byte
-	if len(psk) != KeyLen || priv == nil || len(peerPub) != PubKeyLen {
-		return out, ErrAuthV2
-	}
-	pub, err := ecdh.X25519().NewPublicKey(peerPub)
-	if err != nil {
-		return out, ErrAuthV2
-	}
-	shared, err := priv.ECDH(pub)
-	if err != nil {
-		return out, ErrAuthV2 // low-order point: X25519 отказывает
-	}
-	k, err := hkdf.Key(sha256.New, shared, psk, sessionV2Info, KeyLen)
-	if err != nil {
-		return out, ErrAuthV2
-	}
-	copy(out[:], k)
-	return out, nil
-}
-TBGO_AUTH
-
-mkdir -p "$(dirname "$src"/proto/frame.go)"
-cat > "$src"/proto/frame.go <<'TBGO_FRAME'
-// Package proto — кадрирование и AUTH Shadow/1 (docs/07-proto-v1-spec.md, §2 и §4).
-package proto
-
-import (
-	"encoding/binary"
-	"errors"
-	"io"
-)
-
-// Типы кадров (§2).
-const (
-	TypeData   = 0x01
-	TypeAck    = 0x02
-	TypePad    = 0x03
-	TypePing   = 0x04
-	TypeWU     = 0x05
-	TypeFin    = 0x06
-	TypeMig    = 0x07
-	TypeAuth   = 0x08
-	TypeAuthOK = 0x09
-	TypeClose  = 0x0A
-)
-
-// Флаги кадра (§2).
-const (
-	FlagOpen   = 0x01
-	FlagFin    = 0x02
-	FlagMore   = 0x04
-	FlagUrgent = 0x08
-	// FlagUDP на OPEN: поток несёт датаграммы, а не поток байт. Старый сервер
-	// неизвестный бит игнорирует и попробует TCP — UDP на нём не работает,
-	// поэтому клиент и сервер обновляются вместе.
-	FlagUDP = 0x10
-	// FlagIP на OPEN: поток несёт IP-пакеты (режим TUN). Адресного блока у
-	// такого потока нет, цель выбирает стек вызывающей стороны.
-	FlagIP = 0x20
-)
-
-const (
-	MaxPayload = 1400
-	headerLen  = 8
-	maxStream  = 0x7FFF
-)
-
-var (
-	ErrShortFrame = errors.New("proto: кадр короче заголовка")
-	ErrLength     = errors.New("proto: length > 1400")
-	ErrType       = errors.New("proto: неизвестный тип")
-	ErrStream     = errors.New("proto: stream вне [0, 0x7FFF]")
-	ErrBufSmall   = errors.New("proto: буфер меньше 8+1400")
-)
-
-type Header struct {
-	Type, Flags uint8
-	Stream      uint16
-	Length      uint16
-}
-
-// MarshalTo пишет 8 байт заголовка; b должен быть >= 8.
-func (h Header) MarshalTo(b []byte) {
-	b = b[:headerLen]
-	b[0] = h.Type
-	b[1] = h.Flags
-	binary.BigEndian.PutUint16(b[2:], h.Stream)
-	binary.BigEndian.PutUint16(b[4:], h.Length)
-	binary.BigEndian.PutUint16(b[6:], 0) // reserved
-}
-
-// ParseHeader валидирует заголовок по §2; неизвестные биты flags не ошибка.
-func ParseHeader(b []byte) (Header, error) {
-	if len(b) < headerLen {
-		return Header{}, ErrShortFrame
-	}
-	h := Header{
-		Type:   b[0],
-		Flags:  b[1],
-		Stream: binary.BigEndian.Uint16(b[2:]),
-		Length: binary.BigEndian.Uint16(b[4:]),
-	}
-	if h.Length > MaxPayload {
-		return Header{}, ErrLength
-	}
-	if int(h.Stream) > maxStream {
-		return Header{}, ErrStream
-	}
-	if !knownType(h.Type) {
-		return Header{}, ErrType
-	}
-	return h, nil
-}
-
-func knownType(t uint8) bool { return t >= TypeData && t <= TypeClose }
-
-// ReadFrame читает кадр в buf (>= 8+MaxPayload); payload — срез buf, без аллокаций.
-func ReadFrame(r io.Reader, buf []byte) (Header, []byte, error) {
-	if len(buf) < headerLen+MaxPayload {
-		return Header{}, nil, ErrBufSmall
-	}
-	if _, err := io.ReadFull(r, buf[:headerLen]); err != nil {
-		return Header{}, nil, err
-	}
-	h, err := ParseHeader(buf[:headerLen])
-	if err != nil {
-		return Header{}, nil, err
-	}
-	p := buf[headerLen : headerLen+int(h.Length)]
-	if _, err := io.ReadFull(r, p); err != nil {
-		return Header{}, nil, err
-	}
-	return h, p, nil
-}
-
-// WriteFrame пишет кадр; Length всегда равен len(payload).
-func WriteFrame(w io.Writer, h Header, payload []byte) error {
-	if len(payload) > MaxPayload {
-		return ErrLength
-	}
-	h.Length = uint16(len(payload))
-	var hb [headerLen]byte
-	h.MarshalTo(hb[:])
-	if _, err := w.Write(hb[:]); err != nil {
-		return err
-	}
-	if len(payload) == 0 {
-		return nil
-	}
-	_, err := w.Write(payload)
-	return err
-}
-
-// WUPayload кодирует WU: stream u16 + delta u32.
-func WUPayload(stream uint16, delta uint32) [6]byte {
-	var b [6]byte
-	binary.BigEndian.PutUint16(b[0:], stream)
-	binary.BigEndian.PutUint32(b[2:], delta)
-	return b
-}
-
-func ParseWU(p []byte) (stream uint16, delta uint32, ok bool) {
-	if len(p) != 6 {
-		return 0, 0, false
-	}
-	return binary.BigEndian.Uint16(p[0:]), binary.BigEndian.Uint32(p[2:]), true
-}
-TBGO_FRAME
-
-mkdir -p "$(dirname "$src"/proto/target.go)"
-cat > "$src"/proto/target.go <<'TBGO_TARGET'
-package proto
-
-// Адресный блок §3: atyp + адрес + port. Общий кодек для клиента и сервера.
-
-import (
-	"errors"
-	"net"
-	"strconv"
-)
-
-const (
-	AtypIPv4   = 1
-	AtypDomain = 2
-	AtypIPv6   = 3
-)
-
-var ErrTarget = errors.New("proto: битый адрес цели")
-
-// EncodeTarget кодирует host:port в адресный блок §3.
-// host — IPv4, IPv6 (без скобок) или домен; port — число или строка с числом.
-func EncodeTarget(host, port string) ([]byte, error) {
-	p, err := strconv.Atoi(port)
-	if err != nil || p < 1 || p > 65535 {
-		return nil, ErrTarget
-	}
-	if ip := net.ParseIP(host); ip != nil {
-		if v4 := ip.To4(); v4 != nil {
-			b := make([]byte, 0, 1+4+2)
-			b = append(b, AtypIPv4)
-			b = append(b, v4...)
-			return append(b, byte(p>>8), byte(p)), nil
-		}
-		b := make([]byte, 0, 1+16+2)
-		b = append(b, AtypIPv6)
-		b = append(b, ip.To16()...)
-		return append(b, byte(p>>8), byte(p)), nil
-	}
-	if len(host) == 0 || len(host) > 255 {
-		return nil, ErrTarget
-	}
-	b := make([]byte, 0, 2+len(host)+2)
-	b = append(b, AtypDomain, byte(len(host)))
-	b = append(b, host...)
-	return append(b, byte(p>>8), byte(p)), nil
-}
-
-// DecodeTarget разбирает адресный блок §3 в host и port.
-func DecodeTarget(b []byte) (host, port string, err error) {
-	if len(b) < 1 {
-		return "", "", ErrTarget
-	}
-	var rest []byte
-	switch b[0] {
-	case AtypIPv4:
-		if len(b) < 1+4+2 {
-			return "", "", ErrTarget
-		}
-		host = net.IP(b[1 : 1+4]).String()
-		rest = b[1+4:]
-	case AtypIPv6:
-		if len(b) < 1+16+2 {
-			return "", "", ErrTarget
-		}
-		host = net.IP(b[1 : 1+16]).String()
-		rest = b[1+16:]
-	case AtypDomain:
-		if len(b) < 2 {
-			return "", "", ErrTarget
-		}
-		n := int(b[1])
-		if n == 0 || len(b) < 2+n+2 {
-			return "", "", ErrTarget
-		}
-		host = string(b[2 : 2+n])
-		rest = b[2+n:]
-	default:
-		return "", "", ErrTarget
-	}
-	p := int(rest[0])<<8 | int(rest[1])
-	if p == 0 {
-		return "", "", ErrTarget
-	}
-	return host, strconv.Itoa(p), nil
-}
-
-// TargetLen возвращает длину адресного блока или -1, если он битый.
-func TargetLen(b []byte) int {
-	if _, _, err := DecodeTarget(b); err != nil {
-		return -1
-	}
-	_, _, _ = DecodeTarget(b)
-	// длина = весь блок; считаем по atyp
-	switch b[0] {
-	case AtypIPv4:
-		return 1 + 4 + 2
-	case AtypIPv6:
-		return 1 + 16 + 2
-	case AtypDomain:
-		return 2 + int(b[1]) + 2
-	}
-	return -1
-}
-TBGO_TARGET
-
-mkdir -p "$(dirname "$src"/cmd/shadow-bridge/main.go)"
-cat > "$src"/cmd/shadow-bridge/main.go <<'TBGO_MAIN'
-// shadow-bridge — продакшен-версия, BACKEND (зарубеж).
-//
-// Архитектура «Единый отпечаток»: эта программа НЕ делает TLS/uTLS сама —
-// за неё это делает локальный Xray (тот же chain-xray, что и раньше),
-// у которого outbound — protocol:"freedom" с streamSettings network:"xhttp"
-// и security:"tls", fingerprint:"chrome", redirect на RELAY_DOMAIN:443/путь.
-// Эта программа просто дозванивается на ЛОКАЛЬНЫЙ dokodemo-door-инбаунд
-// того Xray (127.0.0.1:port) обычным TCP — байты, которые она пишет,
-// Xray сам заворачивает в честный XHTTP+TLS(uTLS chrome) наружу. Снаружи
-// это неотличимо от настоящего клиента Happ/Incy, потому что это буквально
-// тот же код.
-//
-// После AUTH (PSK, AuthV2) принимает потоки от RELAY (RELAY открывает,
-// здесь только принимают — см. комментарий в cmd/shadow-relay) и сама
-// делает egress в интернет с той же политикой блокировки приватных
-// диапазонов, что была у исходного chain-bridge.
-package main
-
-import (
-	"bufio"
-	"context"
-	"io"
-	"log/slog"
-	"net"
-	"os"
-	"os/signal"
-	"sync"
-	"syscall"
-	"time"
-
-	"shadow/mux"
-	"shadow/proto"
-)
-
-type conf struct {
-	Dial    string // локальный dokodemo-порт собственного Xray, напр. 127.0.0.1:11090
-	PSKFile string
-}
-
-func loadConf(path string) (conf, error) {
-	f, err := os.Open(path)
-	if err != nil {
-		return conf{}, err
-	}
-	defer f.Close()
-	m := map[string]string{}
-	sc := bufio.NewScanner(f)
-	for sc.Scan() {
-		line := sc.Text()
-		i := idx(line, '=')
-		if i < 0 {
-			continue
-		}
-		k, v := trim(line[:i]), trim(line[i+1:])
-		if len(v) >= 2 && v[0] == '"' && v[len(v)-1] == '"' {
-			v = v[1 : len(v)-1]
-		}
-		m[k] = v
-	}
-	return conf{Dial: m["dial"], PSKFile: m["psk_file"]}, nil
-}
-func idx(s string, b byte) int {
-	for i := 0; i < len(s); i++ {
-		if s[i] == b {
-			return i
-		}
-	}
-	return -1
-}
-func trim(s string) string {
-	for len(s) > 0 && (s[0] == ' ' || s[0] == '\t') {
-		s = s[1:]
-	}
-	for len(s) > 0 && (s[len(s)-1] == ' ' || s[len(s)-1] == '\t') {
-		s = s[:len(s)-1]
-	}
-	return s
-}
-
-type pskStore struct {
-	mu   sync.RWMutex
-	path string
-	val  []byte
-}
-
-func (s *pskStore) load() error {
-	b, err := os.ReadFile(s.path)
-	if err != nil {
-		return err
-	}
-	p, err := parsePSK(b)
-	if err != nil {
-		return err
-	}
-	s.mu.Lock()
-	s.val = p
-	s.mu.Unlock()
-	return nil
-}
-func (s *pskStore) get() []byte {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	return s.val
-}
-func parsePSK(b []byte) ([]byte, error) {
-	s := string(trimBytes(b))
-	if len(s) == 64 {
-		dst := make([]byte, 32)
-		n := 0
-		for i := 0; i+1 < len(s); i += 2 {
-			hi, e1 := hexVal(s[i])
-			lo, e2 := hexVal(s[i+1])
-			if e1 != nil || e2 != nil {
-				return nil, &parseErr{"psk: кривой hex"}
-			}
-			dst[n] = hi<<4 | lo
-			n++
-		}
-		if n != 32 {
-			return nil, &parseErr{"psk: кривая длина"}
-		}
-		return dst, nil
-	}
-	if len(b) == 32 {
-		return b, nil
-	}
-	return nil, &parseErr{"psk: нужно 32 байта или 64 hex-символа"}
-}
-func hexVal(c byte) (byte, error) {
-	switch {
-	case c >= '0' && c <= '9':
-		return c - '0', nil
-	case c >= 'a' && c <= 'f':
-		return c - 'a' + 10, nil
-	case c >= 'A' && c <= 'F':
-		return c - 'A' + 10, nil
-	}
-	return 0, &parseErr{"bad hex"}
-}
-
-type parseErr struct{ s string }
-
-func (e *parseErr) Error() string { return e.s }
-
-func trimBytes(b []byte) []byte {
-	for len(b) > 0 && (b[len(b)-1] == '\n' || b[len(b)-1] == '\r' || b[len(b)-1] == ' ') {
-		b = b[:len(b)-1]
-	}
-	return b
-}
-
-// egress-политика: как у исходного chain-bridge (freedom.finalRules) —
-// RFC1918/loopback/link-local/metadata блокируются.
-var blockedNets []*net.IPNet
-
-func init() {
-	for _, c := range []string{
-		"0.0.0.0/8", "10.0.0.0/8", "100.64.0.0/10", "127.0.0.0/8", "169.254.0.0/16",
-		"172.16.0.0/12", "192.0.0.0/24", "192.168.0.0/16", "198.18.0.0/15",
-		"224.0.0.0/4", "240.0.0.0/4", "::1/128", "fc00::/7", "fe80::/10", "ff00::/8",
-	} {
-		_, n, err := net.ParseCIDR(c)
-		if err == nil {
-			blockedNets = append(blockedNets, n)
-		}
-	}
-}
-func blocked(host string) bool {
-	ip := net.ParseIP(host)
-	if ip == nil {
-		return false
-	}
-	for _, n := range blockedNets {
-		if n.Contains(ip) {
-			return true
-		}
-	}
-	return false
-}
-
-func main() {
-	path := "/etc/shadow-bridge/shadow-bridge.toml"
-	if len(os.Args) > 2 && os.Args[1] == "-config" {
-		path = os.Args[2]
-	}
-	c, err := loadConf(path)
-	if err != nil {
-		slog.Error("config", "err", err)
-		os.Exit(1)
-	}
-	psk := &pskStore{path: c.PSKFile}
-	if err := psk.load(); err != nil {
-		slog.Error("psk", "err", err)
-		os.Exit(1)
-	}
-	sig := make(chan os.Signal, 1)
-	signal.Notify(sig, syscall.SIGHUP)
-	go func() {
-		for range sig {
-			if err := psk.load(); err != nil {
-				slog.Error("ротация PSK не удалась, оставлен прежний", "err", err)
-			} else {
-				slog.Info("PSK перечитан по SIGHUP")
-			}
-		}
-	}()
-
-	backoff := time.Second
-	for {
-		if err := runOnce(c.Dial, psk); err != nil {
-			slog.Warn("сессия оборвалась", "err", err, "retry_in", backoff)
-		}
-		time.Sleep(backoff)
-		if backoff < 30*time.Second {
-			backoff *= 2
-		} else {
-			backoff = 30 * time.Second
-		}
-		if err == nil {
-			backoff = time.Second
-		}
-	}
-}
-
-func runOnce(dial string, psk *pskStore) (err error) {
-	raw, err := net.DialTimeout("tcp", dial, 10*time.Second)
-	if err != nil {
-		return err
-	}
-	if tc, ok := raw.(*net.TCPConn); ok {
-		tc.SetNoDelay(true)
-	}
-	s, err := mux.New(raw, mux.Config{IsClient: true, PSK: psk.get(), AuthV2: true})
-	if err != nil {
-		raw.Close()
-		return err
-	}
-	defer s.Close()
-	slog.Info("сессия к RELAY установлена (через локальный Xray/XHTTP)")
-	for {
-		ctx, cancel := context.WithTimeout(context.Background(), 24*time.Hour)
-		st, err := s.AcceptStream(ctx)
-		cancel()
-		if err != nil {
-			return err
-		}
-		go handleStream(st)
-	}
-}
-
-func handleStream(st *mux.Stream) {
-	defer st.Close()
-	host, port, err := proto.DecodeTarget(st.Target())
-	if err != nil {
-		return
-	}
-	if blocked(host) {
-		return
-	}
-	d := net.Dialer{Timeout: 10 * time.Second}
-	up, err := d.Dial("tcp", net.JoinHostPort(host, port))
-	if err != nil {
-		return
-	}
-	defer up.Close()
-	if tc, ok := up.(*net.TCPConn); ok {
-		tc.SetNoDelay(true)
-	}
-	var wg sync.WaitGroup
-	wg.Add(2)
-	go func() { defer wg.Done(); io.Copy(up, st) }()
-	go func() { defer wg.Done(); io.Copy(st, up); up.Close() }()
-	wg.Wait()
-}
-TBGO_MAIN
-( cd "$src" && /usr/local/bin/go build -o /usr/local/bin/shadow-bridge ./cmd/shadow-bridge )
+# ── shadow-bridge: бинарник уже собран и доставлен с RELAY (кросс-компиляция
+#    под архитектуру BACKEND) — на BACKEND Go-toolchain не нужен вообще.
+#    Сам Shadow-протокол (AUTH, мультиплексирование) не делает TLS/uTLS —
+#    этим занимается chain-xray выше.
+[ -s /root/.shadow-bridge-bin ] || { echo "бинарник shadow-bridge не был доставлен с RELAY" >&2; exit 1; }
+install -m 755 /root/.shadow-bridge-bin /usr/local/bin/shadow-bridge
+rm -f /root/.shadow-bridge-bin
 
 mkdir -p /etc/shadow-bridge
 printf '%s' "$TPSK" > /etc/shadow-bridge/psk
@@ -8480,10 +6244,302 @@ func handleSocks(c net.Conn, p *pool) {
 TRGO_MAIN
   ( cd "$src" && /usr/local/bin/go build -o /usr/local/bin/shadow-relay ./cmd/shadow-relay ) || return 1
 
+  # ── shadow-bridge: та же исходная база (mux/proto), кросс-компиляция под
+  #    архитектуру BACKEND и доставка готового бинарника по SSH. На BACKEND
+  #    из-за этого не нужен ни Go-toolchain, ни повторная копия mux/proto —
+  #    единственный источник истины для обеих сторон лежит здесь, на RELAY.
+mkdir -p "$(dirname "$src"/cmd/shadow-bridge/main.go)"
+cat > "$src"/cmd/shadow-bridge/main.go <<'TRGO_BRIDGE_MAIN'
+// shadow-bridge — продакшен-версия, BACKEND (зарубеж).
+//
+// Архитектура «Единый отпечаток»: эта программа НЕ делает TLS/uTLS сама —
+// за неё это делает локальный Xray (тот же chain-xray, что и раньше),
+// у которого outbound — protocol:"freedom" с streamSettings network:"xhttp"
+// и security:"tls", fingerprint:"chrome", redirect на RELAY_DOMAIN:443/путь.
+// Эта программа просто дозванивается на ЛОКАЛЬНЫЙ dokodemo-door-инбаунд
+// того Xray (127.0.0.1:port) обычным TCP — байты, которые она пишет,
+// Xray сам заворачивает в честный XHTTP+TLS(uTLS chrome) наружу. Снаружи
+// это неотличимо от настоящего клиента Happ/Incy, потому что это буквально
+// тот же код.
+//
+// После AUTH (PSK, AuthV2) принимает потоки от RELAY (RELAY открывает,
+// здесь только принимают — см. комментарий в cmd/shadow-relay) и сама
+// делает egress в интернет с той же политикой блокировки приватных
+// диапазонов, что была у исходного chain-bridge.
+package main
+
+import (
+	"bufio"
+	"context"
+	"io"
+	"log/slog"
+	"net"
+	"os"
+	"os/signal"
+	"sync"
+	"syscall"
+	"time"
+
+	"shadow/mux"
+	"shadow/proto"
+)
+
+type conf struct {
+	Dial    string // локальный dokodemo-порт собственного Xray, напр. 127.0.0.1:11090
+	PSKFile string
+}
+
+func loadConf(path string) (conf, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return conf{}, err
+	}
+	defer f.Close()
+	m := map[string]string{}
+	sc := bufio.NewScanner(f)
+	for sc.Scan() {
+		line := sc.Text()
+		i := idx(line, '=')
+		if i < 0 {
+			continue
+		}
+		k, v := trim(line[:i]), trim(line[i+1:])
+		if len(v) >= 2 && v[0] == '"' && v[len(v)-1] == '"' {
+			v = v[1 : len(v)-1]
+		}
+		m[k] = v
+	}
+	return conf{Dial: m["dial"], PSKFile: m["psk_file"]}, nil
+}
+func idx(s string, b byte) int {
+	for i := 0; i < len(s); i++ {
+		if s[i] == b {
+			return i
+		}
+	}
+	return -1
+}
+func trim(s string) string {
+	for len(s) > 0 && (s[0] == ' ' || s[0] == '\t') {
+		s = s[1:]
+	}
+	for len(s) > 0 && (s[len(s)-1] == ' ' || s[len(s)-1] == '\t') {
+		s = s[:len(s)-1]
+	}
+	return s
+}
+
+type pskStore struct {
+	mu   sync.RWMutex
+	path string
+	val  []byte
+}
+
+func (s *pskStore) load() error {
+	b, err := os.ReadFile(s.path)
+	if err != nil {
+		return err
+	}
+	p, err := parsePSK(b)
+	if err != nil {
+		return err
+	}
+	s.mu.Lock()
+	s.val = p
+	s.mu.Unlock()
+	return nil
+}
+func (s *pskStore) get() []byte {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.val
+}
+func parsePSK(b []byte) ([]byte, error) {
+	s := string(trimBytes(b))
+	if len(s) == 64 {
+		dst := make([]byte, 32)
+		n := 0
+		for i := 0; i+1 < len(s); i += 2 {
+			hi, e1 := hexVal(s[i])
+			lo, e2 := hexVal(s[i+1])
+			if e1 != nil || e2 != nil {
+				return nil, &parseErr{"psk: кривой hex"}
+			}
+			dst[n] = hi<<4 | lo
+			n++
+		}
+		if n != 32 {
+			return nil, &parseErr{"psk: кривая длина"}
+		}
+		return dst, nil
+	}
+	if len(b) == 32 {
+		return b, nil
+	}
+	return nil, &parseErr{"psk: нужно 32 байта или 64 hex-символа"}
+}
+func hexVal(c byte) (byte, error) {
+	switch {
+	case c >= '0' && c <= '9':
+		return c - '0', nil
+	case c >= 'a' && c <= 'f':
+		return c - 'a' + 10, nil
+	case c >= 'A' && c <= 'F':
+		return c - 'A' + 10, nil
+	}
+	return 0, &parseErr{"bad hex"}
+}
+
+type parseErr struct{ s string }
+
+func (e *parseErr) Error() string { return e.s }
+
+func trimBytes(b []byte) []byte {
+	for len(b) > 0 && (b[len(b)-1] == '\n' || b[len(b)-1] == '\r' || b[len(b)-1] == ' ') {
+		b = b[:len(b)-1]
+	}
+	return b
+}
+
+// egress-политика: как у исходного chain-bridge (freedom.finalRules) —
+// RFC1918/loopback/link-local/metadata блокируются.
+var blockedNets []*net.IPNet
+
+func init() {
+	for _, c := range []string{
+		"0.0.0.0/8", "10.0.0.0/8", "100.64.0.0/10", "127.0.0.0/8", "169.254.0.0/16",
+		"172.16.0.0/12", "192.0.0.0/24", "192.168.0.0/16", "198.18.0.0/15",
+		"224.0.0.0/4", "240.0.0.0/4", "::1/128", "fc00::/7", "fe80::/10", "ff00::/8",
+	} {
+		_, n, err := net.ParseCIDR(c)
+		if err == nil {
+			blockedNets = append(blockedNets, n)
+		}
+	}
+}
+func blocked(host string) bool {
+	ip := net.ParseIP(host)
+	if ip == nil {
+		return false
+	}
+	for _, n := range blockedNets {
+		if n.Contains(ip) {
+			return true
+		}
+	}
+	return false
+}
+
+func main() {
+	path := "/etc/shadow-bridge/shadow-bridge.toml"
+	if len(os.Args) > 2 && os.Args[1] == "-config" {
+		path = os.Args[2]
+	}
+	c, err := loadConf(path)
+	if err != nil {
+		slog.Error("config", "err", err)
+		os.Exit(1)
+	}
+	psk := &pskStore{path: c.PSKFile}
+	if err := psk.load(); err != nil {
+		slog.Error("psk", "err", err)
+		os.Exit(1)
+	}
+	sig := make(chan os.Signal, 1)
+	signal.Notify(sig, syscall.SIGHUP)
+	go func() {
+		for range sig {
+			if err := psk.load(); err != nil {
+				slog.Error("ротация PSK не удалась, оставлен прежний", "err", err)
+			} else {
+				slog.Info("PSK перечитан по SIGHUP")
+			}
+		}
+	}()
+
+	backoff := time.Second
+	for {
+		if err := runOnce(c.Dial, psk); err != nil {
+			slog.Warn("сессия оборвалась", "err", err, "retry_in", backoff)
+		}
+		time.Sleep(backoff)
+		if backoff < 30*time.Second {
+			backoff *= 2
+		} else {
+			backoff = 30 * time.Second
+		}
+		if err == nil {
+			backoff = time.Second
+		}
+	}
+}
+
+func runOnce(dial string, psk *pskStore) (err error) {
+	raw, err := net.DialTimeout("tcp", dial, 10*time.Second)
+	if err != nil {
+		return err
+	}
+	if tc, ok := raw.(*net.TCPConn); ok {
+		tc.SetNoDelay(true)
+	}
+	s, err := mux.New(raw, mux.Config{IsClient: true, PSK: psk.get(), AuthV2: true})
+	if err != nil {
+		raw.Close()
+		return err
+	}
+	defer s.Close()
+	slog.Info("сессия к RELAY установлена (через локальный Xray/XHTTP)")
+	for {
+		ctx, cancel := context.WithTimeout(context.Background(), 24*time.Hour)
+		st, err := s.AcceptStream(ctx)
+		cancel()
+		if err != nil {
+			return err
+		}
+		go handleStream(st)
+	}
+}
+
+func handleStream(st *mux.Stream) {
+	defer st.Close()
+	host, port, err := proto.DecodeTarget(st.Target())
+	if err != nil {
+		return
+	}
+	if blocked(host) {
+		return
+	}
+	d := net.Dialer{Timeout: 10 * time.Second}
+	up, err := d.Dial("tcp", net.JoinHostPort(host, port))
+	if err != nil {
+		return
+	}
+	defer up.Close()
+	if tc, ok := up.(*net.TCPConn); ok {
+		tc.SetNoDelay(true)
+	}
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() { defer wg.Done(); io.Copy(up, st) }()
+	go func() { defer wg.Done(); io.Copy(st, up); up.Close() }()
+	wg.Wait()
+}
+TRGO_BRIDGE_MAIN
+  local backend_goarch
+  case "$(remote "uname -m" 2>/dev/null)" in
+    x86_64 | amd64) backend_goarch=amd64 ;;
+    aarch64 | arm64) backend_goarch=arm64 ;;
+    *) echo "не удалось определить архитектуру BACKEND для сборки shadow-bridge" >&2; return 1 ;;
+  esac
+  ( cd "$src" && GOOS=linux GOARCH="$backend_goarch" /usr/local/bin/go build -o /tmp/shadow-bridge.built ./cmd/shadow-bridge ) || return 1
+  ssh "${SSH_OPTS[@]}" "root@$BACKEND_IP" "umask 077; cat > /root/.shadow-bridge-bin" < /tmp/shadow-bridge.built || return 1
+  rm -f /tmp/shadow-bridge.built
+
   mkdir -p /etc/shadow-relay
-  if [ ! -s /etc/shadow-relay/psk ]; then
-    openssl rand -hex 32 > /etc/shadow-relay/psk
-  fi
+  # ВАЖНО: секрет должен быть ровно тем же $SHADOW_PSK, что уйдёт в bridge-install.sh
+  # на BACKEND (см. backend_bridge) — независимая генерация здесь привела бы
+  # к несовпадающим PSK на двух концах и молчаливому провалу AUTH.
+  printf '%s' "$SHADOW_PSK" > /etc/shadow-relay/psk
   chmod 600 /etc/shadow-relay/psk
 
   local cover="/var/www/honeypot/$DOMAIN"
