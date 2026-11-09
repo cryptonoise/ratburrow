@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-VERSION="4.0"
+VERSION="4.1"
 NAME="ShadowRat"
 
 set -u
