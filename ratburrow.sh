@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-VERSION="4.1"
+VERSION="4.2"
 NAME="RatBurrow"
 
 set -u
@@ -4036,7 +4036,7 @@ systemctl enable --now chain-health.timer >/dev/null 2>&1
 /usr/local/bin/chain-health || true
 EOF
 
-  # BACKEND: keepalive HTTP/2 для моста и сторож chain-watchdog (таймер 20 с); идемпотентно, подходит и для уже установленного моста
+  # BACKEND: keepalive HTTP/2 для моста и сторож chain-watchdog (раз в минуту со случайным разбросом); идемпотентно, подходит и для уже установленного моста
   cat > "$D/watchdog-install.sh" <<'EOF'
 set -Eeuo pipefail
 CF=/etc/chain-bridge/config.json
@@ -4062,9 +4062,10 @@ fi
 mkdir -p /var/lib/chain-bridge/watchdog
 cat > /usr/local/bin/chain-watchdog <<'EOT_WD'
 #!/bin/bash
-# chain-watchdog — сторож моста (BACKEND). Раз в 20 с читает у RELAY состояние туннеля (его пишет chain-health).
-# Перезапускает chain-bridge, только если RELAY доступен, но не видит мост (3 проверки подряд, около 1 мин)
-# или сквозная проверка на RELAY провалилась 2 раза подряд (около 4 мин). Недоступность RELAY и устаревшее
+# chain-watchdog — сторож моста (BACKEND). Раз в минуту (с разбросом до 30 с, чтобы не было «метронома» на границе)
+# читает у RELAY состояние туннеля (его пишет chain-health).
+# Перезапускает chain-bridge, только если RELAY доступен, но не видит мост (2 проверки подряд, около 2–3 мин)
+# или сквозная проверка на RELAY провалилась 2 раза подряд (около 4–5 мин). Недоступность RELAY и устаревшее
 # состояние — не повод: перезапуск моста тут не поможет. Не чаще раза в 3 мин и не больше 4 раз в час.
 #   chain-watchdog            одна проверка (запускается таймером)
 #   chain-watchdog --status   последнее решение и история перезапусков
@@ -4110,7 +4111,7 @@ else
   fi
   [ "$cf" -eq 0 ] && [ "$ef" -eq 0 ] || verdict=failing
 fi
-if [ "$verdict" = failing ] && { [ "$cf" -ge 3 ] || [ "$ef" -ge 2 ]; }; then
+if [ "$verdict" = failing ] && { [ "$cf" -ge 2 ] || [ "$ef" -ge 2 ]; }; then
   last=$(tail -n 1 "$S/restarts" 2>/dev/null | awk '{print $1}'); num "$last" || last=0
   recent=$(awk -v n="$now" '$1 > n - 3600' "$S/restarts" 2>/dev/null | wc -l)
   if [ $((now - last)) -lt 180 ]; then
@@ -4121,7 +4122,7 @@ if [ "$verdict" = failing ] && { [ "$cf" -ge 3 ] || [ "$ef" -ge 2 ]; }; then
     logger -t chain-watchdog "перезапуск chain-bridge: $reason"
     echo "$now $reason" >> "$S/restarts"; tail -n 50 "$S/restarts" > "$S/restarts.tmp" && mv -f "$S/restarts.tmp" "$S/restarts"
     systemctl restart chain-bridge
-    cf=0; ef=0; grace=$((now + 90)); verdict=restarted
+    cf=0; ef=0; grace=$((now + 180)); verdict=restarted
   fi
 fi
 prev=$(sv verdict)
@@ -4141,12 +4142,13 @@ ExecStart=/usr/local/bin/chain-watchdog
 EOT_S
 cat > /etc/systemd/system/chain-watchdog.timer <<'EOT_T'
 [Unit]
-Description=chain watchdog: раз в 20 секунд
+Description=chain watchdog: раз в минуту со случайным разбросом
 
 [Timer]
 OnBootSec=120
-OnUnitActiveSec=20
-AccuracySec=2
+OnUnitActiveSec=60
+RandomizedDelaySec=30
+AccuracySec=5
 
 [Install]
 WantedBy=timers.target
@@ -4499,7 +4501,7 @@ run_install() {
   # [10] мост на BACKEND
   section "BACKEND: мост Xray"
   step_run "Установка Xray (проверка SHA-256) и запуск chain-bridge" backend_bridge || die "мост не запустился (journalctl -u chain-bridge на BACKEND)"
-  step_run "Сторож моста (chain-watchdog, раз в 20 с) и keepalive HTTP/2" rscript "$TMPD/watchdog-install.sh" || warn "сторож моста установлен не полностью (см. лог)"
+  step_run "Сторож моста (chain-watchdog, раз в минуту) и keepalive HTTP/2" rscript "$TMPD/watchdog-install.sh" || warn "сторож моста установлен не полностью (см. лог)"
 
   # [11] проверка цепочки
   section "Проверка цепочки"
@@ -4596,7 +4598,7 @@ run_install() {
   echo "   BACKEND:"
   echo "     chain-set-relay IP           указать новый IP RELAY и перезапустить мост"
   echo "     chain-update-bridge [ВЕРСИЯ|--status]   привести Xray моста к версии RELAY или к указанной; --status — показать версии (только вручную)"
-  echo "     chain-watchdog --status      решение сторожа и история перезапусков моста (сторож проверяет раз в 20 с)"
+  echo "     chain-watchdog --status      решение сторожа и история перезапусков моста (сторож проверяет раз в минуту)"
   echo "     systemctl status chain-bridge, journalctl -u chain-bridge   состояние и журнал моста"
   echo
   echo "  ${B}Открыть панель (выполните на СВОЁМ компьютере):${R}"
@@ -4632,7 +4634,7 @@ run_upgrade() {
   echo "${B}Обновление до v$VERSION: сторож моста и keepalive${R}"
   thin
   info "RELAY: chain-health (состояние туннеля раз в 30 с) и путь /health в nginx; заодно исправляется путь версии Xray"
-  info "BACKEND: keepalive HTTP/2 для моста и chain-watchdog (проверка раз в 20 с); мост перезапустится один раз, потоки оборвутся на несколько секунд"
+  info "BACKEND: keepalive HTTP/2 для моста и chain-watchdog (проверка раз в минуту); мост перезапустится один раз, потоки оборвутся на несколько секунд"
   info "пользователи, пути клиентов, подписка и сертификат не меняются"
   confirm "Продолжить?" || { echo "  Отменено."; return 0; }
   section "Подключение к BACKEND"
@@ -4642,7 +4644,7 @@ run_upgrade() {
   section "RELAY: состояние туннеля для сторожа"
   step_run "chain-health (таймер 30 с) и путь /health в nginx" lscript "$TMPD/health-relay.sh" "$VER_PATH" || die "RELAY не обновлён (см. лог)"
   section "BACKEND: keepalive и сторож моста"
-  step_run "keepalive HTTP/2 для моста, chain-watchdog (таймер 20 с), перезапуск моста" rscript "$TMPD/watchdog-install.sh" || die "BACKEND не обновлён (см. лог)"
+  step_run "keepalive HTTP/2 для моста, chain-watchdog (таймер 1 мин), перезапуск моста" rscript "$TMPD/watchdog-install.sh" || die "BACKEND не обновлён (см. лог)"
   sed -i "s/^VERSION=.*/VERSION=$VERSION/" "$MARKER_FILE" 2>/dev/null || true
   bk "sed -i 's/^VERSION=.*/VERSION=$VERSION/' '$MARKER_FILE' 2>/dev/null || true" >>"$LOG" 2>&1 || true
   local i
@@ -4658,7 +4660,7 @@ run_upgrade() {
   echo "  ${B}Дальше${R}"
   echo "   • RELAY:   chain-status, chain-health --show"
   echo "   • BACKEND: chain-watchdog --status (решения сторожа и перезапуски), journalctl -t chain-watchdog"
-  echo "   • Сторож перезапускает мост, только если RELAY доступен, но не видит мост (около 1 мин) или сквозная проверка провалилась дважды (около 4 мин)"
+  echo "   • Сторож перезапускает мост, только если RELAY доступен, но не видит мост (около 2–3 мин) или сквозная проверка провалилась дважды (около 4–5 мин)"
   echo
 }
 
