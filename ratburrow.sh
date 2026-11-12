@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
 #
-VERSION="4.2"
+# 4.3: журнал сбоев (/var/log/chain-incidents.log); локальный сторож моста и перезапуск моста по ограниченному SSH-ключу RELAY;
+#      проверка «без моста нет выхода»; автотест после перезагрузки; проверка сертификата; обновление Xray с пробой на BACKEND и откатом;
+#      закреплённые версии Xray и 3x-ui; пункт меню «Проверить сервер на детекты»
+#
+VERSION="4.3"
 NAME="RatBurrow"
 
 set -u
@@ -18,6 +22,9 @@ SUB_TITLE="${SUB_TITLE:-}"   # название подписки в клиент
 CHAIN_USER_PORT=21443     # 127.0.0.1: инбаунд пользователей (за nginx)
 CHAIN_TUNNEL_PORT=21444   # 127.0.0.1: инбаунд туннеля, к которому подключается мост BACKEND (за nginx)
 SELFTEST_PORT=21481       # 127.0.0.1: временный клиент для проверки цепочки
+XRAY_VER="${XRAY_VER:-26.10.31}"   # закреплённая версия Xray для моста BACKEND (проверена; меняется пунктом меню «Обновить Xray»)
+XUI_VER="${XUI_VER:-v3.11.0}"       # закреплённая версия панели 3x-ui для новой установки
+CHECK_REPORT="${CHECK_REPORT:-/root/chain-check-report.txt}"   # отчёт пункта «Проверить сервер на детекты»
 TOTAL=12
 STEP=0
 CHAIN_USER_ID=""; CHAIN_SUB_ID=""; TUNNEL_UUID=""; SUB_PATHS=""; TUNNEL_OBFS=0; VER_PATH=""
@@ -169,11 +176,8 @@ tune_network() {
       "net.core.wmem_max=33554432" \
       "net.ipv4.tcp_rmem=4096 262144 33554432" \
       "net.ipv4.tcp_wmem=4096 262144 33554432" \
-      "net.ipv4.udp_rmem_min=16384" \
-      "net.ipv4.udp_wmem_min=16384" \
       "net.ipv4.tcp_mtu_probing=1" \
       "net.ipv4.tcp_slow_start_after_idle=0" \
-      "net.ipv4.tcp_fastopen=3" \
       "net.core.netdev_max_backlog=16384" \
       "net.core.somaxconn=4096" \
       "net.ipv4.tcp_max_syn_backlog=8192" \
@@ -183,8 +187,13 @@ tune_network() {
       "net.ipv4.tcp_keepalive_probes=5" \
       "fs.file-max=1048576"
     if [ -e /proc/sys/net/netfilter/nf_conntrack_max ]; then echo "net.netfilter.nf_conntrack_max=262144"; fi
+    if [ -e /proc/sys/net/mptcp/enabled ]; then echo "net.mptcp.enabled=0"; fi   # MPTCP не используется: лишнюю поверхность отключаем
   } > "$f"
   sysctl -q -p "$f" >/dev/null 2>&1 || sysctl --system >/dev/null 2>&1 || true
+  # журнал systemd не должен разрастаться на маленьком VPS
+  mkdir -p /etc/systemd/journald.conf.d
+  printf '[Journal]\nSystemMaxUse=200M\nMaxRetentionSec=14day\n' > /etc/systemd/journald.conf.d/chain-limits.conf
+  systemctl restart systemd-journald >/dev/null 2>&1 || true
   return 0
 }
 
@@ -969,7 +978,9 @@ menu() {
   echo "  ${B}1${R}. Подготовить сервер"
   echo "  ${B}2${R}. Настроить защищенный канал RELAY ← BACKEND"
   [ $has -eq 1 ] && echo "  ${B}3${R}. Откат"
-  [ $has -eq 1 ] && echo "  ${B}4${R}. Обновить: сторож моста и keepalive (без переустановки)"
+  [ $has -eq 1 ] && echo "  ${B}4${R}. Обновить до v$VERSION (без переустановки)"
+  [ $has -eq 1 ] && [ "$(marker_get ROLE)" != backend ] && echo "  ${B}5${R}. Обновить Xray на обоих серверах (проба на BACKEND, откат при неудаче)"
+  echo "  ${B}6${R}. Проверить сервер на детекты"
   while true; do
     rd -r -p "${B}?${R} Выберите вариант: " c
     case "$c" in
@@ -977,7 +988,9 @@ menu() {
       2) MODE="install"; return 0 ;;
       3) if [ $has -eq 1 ]; then MODE="uninstall"; return 0; fi; fail "вариант 3 доступен только после установки" ;;
       4) if [ $has -eq 1 ]; then MODE="upgrade"; return 0; fi; fail "вариант 4 доступен только после установки" ;;
-      *) if [ $has -eq 1 ]; then fail "введите от 1 до 4"; else fail "введите от 1 до 2"; fi ;;
+      5) if [ $has -eq 1 ] && [ "$(marker_get ROLE)" != backend ]; then MODE="update-xray"; return 0; fi; fail "вариант 5 доступен только на RELAY после установки" ;;
+      6) MODE="check"; return 0 ;;
+      *) if [ $has -eq 1 ]; then fail "введите от 1 до 6"; else fail "введите 1, 2 или 6"; fi ;;
     esac
   done
 }
@@ -2812,13 +2825,13 @@ EOF
   # 3x-ui: три отдельных шага, чтобы у каждого был свой счётчик времени
   cat > "$D/xui-fetch.sh" <<'EOF'
 set -e
-curl -fsSL --retry 3 https://raw.githubusercontent.com/mhsanaei/3x-ui/master/install.sh -o /tmp/3xui-install.sh
+curl -fsSL --retry 3 "https://raw.githubusercontent.com/mhsanaei/3x-ui/${1:?не передана версия 3x-ui}/install.sh" -o /tmp/3xui-install.sh
 test -s /tmp/3xui-install.sh
 EOF
   cat > "$D/xui-install.sh" <<'EOF'
 set -e
 export XUI_NONINTERACTIVE=1 XUI_DB_TYPE=sqlite XUI_SSL_MODE=none XUI_PANEL_PORT="$1"
-bash /tmp/3xui-install.sh </dev/null
+bash /tmp/3xui-install.sh "${2:-}" </dev/null
 EOF
   cat > "$D/xui-check.sh" <<'EOF'
 set -e
@@ -3034,6 +3047,16 @@ fi
 nginx -t 2>/dev/null && systemctl reload nginx
 [ -f /root/.chain-setup.conf ] && sed -i "s/^BACKEND_IP=.*/BACKEND_IP=$NEW/" /root/.chain-setup.conf
 echo "BACKEND (туннельный путь): $NEW"
+if [ "$NEW" != any ]; then
+  echo "жду подключения моста (до 90 с)…"
+  for _ in $(seq 1 45); do
+    if [ "$(ss -tnH state established '( sport = :21444 )' 2>/dev/null | wc -l)" -ge 1 ]; then echo "мост подключён"; exit 0; fi
+    sleep 2
+  done
+  /usr/local/bin/chain-incident "мост" "после chain-set-backend мост не подключился за 90 с" "новый адрес BACKEND: $NEW; проверьте, что мост запущен и соединение идёт с этого IP" >/dev/null 2>&1 || true
+  echo "мост не подключился за 90 с: проверьте IP BACKEND и состояние моста (journalctl -u chain-bridge на BACKEND)"
+  exit 1
+fi
 EOT4
 chmod +x /usr/local/bin/chain-set-backend
 cat > /usr/local/bin/chain-status <<'EOT5'
@@ -3712,7 +3735,7 @@ PYEOF
   # BACKEND: мост Xray (обратный туннель к RELAY)
   cat > "$D/bridge-install.sh" <<'EOF'
 set -Eeuo pipefail
-RELAY="$1"; DOMAIN="$2"; TPATH="$3"; TUUID="$4"; VPATH="${5:-}"; TOBFS="${6:-0}"
+RELAY="$1"; DOMAIN="$2"; TPATH="$3"; TUUID="$4"; VPATH="${5:-}"; TOBFS="${6:-0}"; XRAYV="${7:-}"
 export DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a
 case "$(uname -m)" in
   x86_64 | amd64) ARCH=64 ;;
@@ -3726,7 +3749,7 @@ if [ ${#need[@]} -gt 0 ]; then
   apt-get -o DPkg::Lock::Timeout=300 install -y curl unzip python3 coreutils ca-certificates
 fi
 tmp=$(mktemp -d); trap 'rm -rf "$tmp"' EXIT
-URL="https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-$ARCH.zip"
+if [ -n "$XRAYV" ]; then URL="https://github.com/XTLS/Xray-core/releases/download/v${XRAYV#v}/Xray-linux-$ARCH.zip"; else URL="https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-$ARCH.zip"; fi
 curl -fsSL --retry 3 -o "$tmp/x.zip" "$URL"
 curl -fsSL --retry 3 -o "$tmp/x.dgst" "$URL.dgst"
 want=$(sed -n 's/^SHA2-256= *//p' "$tmp/x.dgst" | head -n1 | tr -d '[:space:]')
@@ -3775,65 +3798,6 @@ DOMAIN=$DOMAIN
 VPATH=$VPATH
 EOT
 chmod 600 /etc/chain-bridge/sync.conf
-cat > /usr/local/bin/chain-update-bridge <<'EOT'
-#!/bin/bash
-# chain-update-bridge — синхронизация версии Xray моста с RELAY (только вручную, по таймеру ничего не опрашивается)
-#   chain-update-bridge            привести Xray моста к версии RELAY, если версии отличаются
-#   chain-update-bridge 26.10.31   установить указанную версию
-#   chain-update-bridge --status   показать версии на BACKEND и RELAY
-CONF=/etc/chain-bridge/sync.conf; BIN=/usr/local/bin/chain-xray
-get() { sed -n "s/^$1=//p" "$CONF" 2>/dev/null | head -n1; }
-RELAY_IP=$(get RELAY_IP); DOMAIN=$(get DOMAIN); VPATH=$(get VPATH)
-log() { logger -t chain-update "$*"; echo "$(date '+%F %T') $*"; }
-cur=$("$BIN" version 2>/dev/null | awk 'NR==1{print $2}')
-remote() {
-  [ -n "$RELAY_IP" ] && [ -n "$DOMAIN" ] && [ -n "$VPATH" ] || return 1
-  curl -fsS --max-time 15 --resolve "$DOMAIN:443:$RELAY_IP" "https://$DOMAIN/$VPATH/" 2>/dev/null | tr -d '[:space:]'
-}
-valid() { [[ "$1" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; }
-mode="${1:-sync}"
-case "$mode" in
-  --status | status)
-    r=$(remote)
-    echo "Xray на BACKEND: ${cur:-?}"
-    echo "Xray на RELAY:   ${r:-недоступно}"
-    exit 0 ;;
-  sync) target=$(remote) || { echo "RELAY недоступен: версия не получена"; exit 1; }; valid "$target" || { echo "RELAY вернул неверную версию"; exit 1; } ;;
-  *) target="${mode#v}"; valid "$target" || { echo "использование: chain-update-bridge [ВЕРСИЯ|--status]"; exit 1; } ;;
-esac
-if [ "$target" = "$cur" ]; then echo "уже установлена версия $cur"; exit 0; fi
-exec 9>/run/chain-update.lock
-flock -n 9 || exit 0
-case "$(uname -m)" in x86_64 | amd64) ARCH=64 ;; aarch64 | arm64) ARCH=arm64-v8a ;; *) log "неподдерживаемая архитектура"; exit 1 ;; esac
-tmp=$(mktemp -d); trap 'rm -rf "$tmp"' EXIT
-URL="https://github.com/XTLS/Xray-core/releases/download/v$target/Xray-linux-$ARCH.zip"
-if ! curl -fsSL --retry 3 --max-time 300 -o "$tmp/x.zip" "$URL" || ! curl -fsSL --retry 3 --max-time 60 -o "$tmp/x.dgst" "$URL.dgst"; then
-  log "версия $target недоступна на GitHub — пропуск"
-  exit 1
-fi
-want=$(sed -n 's/^SHA2-256= *//p' "$tmp/x.dgst" | head -n1 | tr -d '[:space:]')
-have=$(sha256sum "$tmp/x.zip" | awk '{ print $1 }')
-[ -n "$want" ] && [ "$want" = "$have" ] || { log "контрольная сумма $target не совпала — отмена"; exit 1; }
-unzip -oq "$tmp/x.zip" xray -d "$tmp" || { log "не удалось распаковать $target"; exit 1; }
-"$tmp/xray" run -test -c /etc/chain-bridge/config.json >/dev/null 2>&1 || { log "конфиг моста не проходит проверку версией $target — отмена"; exit 1; }
-cp -f "$BIN" "$BIN.prev"
-install -m 755 "$tmp/xray" "$BIN.new" && mv -f "$BIN.new" "$BIN"
-systemctl restart chain-bridge
-ok=0
-for _ in $(seq 1 20); do
-  sleep 1
-  if systemctl is-active --quiet chain-bridge && ss -tnH state established "( dst $RELAY_IP and dport = :443 )" 2>/dev/null | grep -q .; then ok=1; break; fi
-done
-if [ $ok -eq 1 ]; then
-  log "Xray обновлён: ${cur:-?} -> $target"
-else
-  mv -f "$BIN.prev" "$BIN"
-  systemctl restart chain-bridge
-  log "ОШИБКА: мост не подключился на версии $target — выполнен откат на ${cur:-?}"
-  exit 1
-fi
-EOT
-chmod +x /usr/local/bin/chain-update-bridge
 cat > /etc/systemd/system/chain-bridge.service <<'EOT'
 [Unit]
 Description=chain bridge (Xray reverse tunnel to RELAY)
@@ -3861,26 +3825,6 @@ AmbientCapabilities=
 [Install]
 WantedBy=multi-user.target
 EOT
-cat > /usr/local/bin/chain-set-relay <<'EOT'
-#!/bin/bash
-set -e
-NEW="${1:-}"; [ -n "$NEW" ] || { echo "usage: chain-set-relay НОВЫЙ_IP_RELAY"; exit 1; }
-[[ "$NEW" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "неверный IP"; exit 1; }
-python3 - "$NEW" <<'PY'
-import json, sys
-f = "/etc/chain-bridge/config.json"
-c = json.load(open(f))
-old = c["outbounds"][0]["settings"]["address"]
-c["outbounds"][0]["settings"]["address"] = sys.argv[1]
-json.dump(c, open(f, "w"), indent=2)
-print("RELAY: %s -> %s" % (old, sys.argv[1]))
-PY
-sed -i "s/^RELAY_IP=.*/RELAY_IP=$NEW/" /etc/chain-bridge/sync.conf 2>/dev/null || true
-systemctl restart chain-bridge
-sleep 2
-systemctl is-active chain-bridge
-EOT
-chmod +x /usr/local/bin/chain-set-relay
 systemctl disable --now chain-update-bridge.timer >/dev/null 2>&1 || true
 rm -f /etc/systemd/system/chain-update-bridge.service /etc/systemd/system/chain-update-bridge.timer /etc/chain-bridge/autosync
 systemctl daemon-reload
@@ -3890,8 +3834,8 @@ sleep 3
 systemctl is-active --quiet chain-bridge
 EOF
 
-  # RELAY: состояние туннеля для сторожа BACKEND (chain-health, таймер 30 с) и путь /health в nginx; чинит и путь версии Xray
-  cat > "$D/health-relay.sh" <<'EOF'
+  # RELAY: chain-health (состояние цепочки, счётчик соединений, перезапуск моста по SSH-ключу), автотест после перезагрузки, проверка сертификата; убирает путь /health, чинит путь версии Xray
+  cat > "$D/health-relay.sh" <<'__CHAIN_EOF__'
 set -Eeuo pipefail
 VPATH="${1:?не передан секретный путь версии}"
 F=/etc/nginx/sites-available/xpn.conf
@@ -3899,21 +3843,30 @@ F=/etc/nginx/sites-available/xpn.conf
 mkdir -p /var/lib/chain
 cat > /usr/local/bin/chain-health <<'EOT_H'
 #!/bin/bash
-# chain-health — состояние туннеля для сторожа на BACKEND (запускается таймером chain-health.timer раз в 30 с).
-# Пишет /var/lib/chain/health: число соединений моста и результат сквозной проверки
-# (клиент → nginx → туннель → BACKEND → интернет, не чаще раза в 2 мин и только при подключённом мосте).
-# Файл по секретному пути отдаёт nginx только с IP BACKEND.
-#   chain-health          обновить файл состояния
+# chain-health — состояние цепочки на RELAY (запускается таймером chain-health.timer раз в 30 с).
+# Пишет /var/lib/chain/health (соединения моста, сквозная проверка), считает новые соединения в минуту (nginx stub_status, без адресов клиентов),
+# записывает сбои в /var/log/chain-incidents.log и, если мост пропал, просит BACKEND перезапустить его по SSH
+# (отдельный ключ /root/.ssh/chain-restart; на BACKEND он разрешает только одну команду — перезапуск моста).
+#   chain-health          обновить состояние
 #   chain-health --show   показать состояние (его выводит и chain-status)
 H=${CHAIN_HEALTH_FILE:-/var/lib/chain/health}
+ST=${CHAIN_HEALTH_STATE:-/var/lib/chain/state}
+MET=${CHAIN_HEALTH_METRICS:-/var/lib/chain/metrics}
 conf=${CHAIN_SETUP_CONF:-/root/.chain-setup.conf}
 now=${CHAIN_HEALTH_NOW:-$(date +%s)}
+RKEY=${CHAIN_RESTART_KEY:-/root/.ssh/chain-restart}
+STATUS_URL=${CHAIN_STATUS_URL:-http://127.0.0.1:21480/nginx_status}
 get() { sed -n "s/^$1=//p" "$conf" 2>/dev/null | head -n1; }
 kv() { sed -n "s/^$1=//p" "$H" 2>/dev/null | head -n1; }
+sv() { sed -n "s/^$1=//p" "$ST" 2>/dev/null | head -n1; }
+setst() { { grep -v "^$1=" "$ST" 2>/dev/null || true; printf '%s=%s\n' "$1" "$2"; } > "$ST.tmp" && mv -f "$ST.tmp" "$ST"; }
+inc() { /usr/local/bin/chain-incident "$@" >/dev/null 2>&1 || true; }
 if [ "${1:-}" = "--show" ]; then
   if [ ! -r "$H" ]; then echo "сторож:       данных нет (chain-health ещё не запускался)"; exit 0; fi
   ts=$(kv ts); c=$(kv conns); e=$(kv e2e); et=$(kv e2e_ts)
   echo "сторож:       проверено $((now - ${ts:-0})) с назад; соединений моста: ${c:-?}; сквозная проверка: ${e:-?} ($((now - ${et:-0})) с назад)"
+  [ -s "$MET" ] && tail -n 20 "$MET" | awk '{s+=$3;n++;a=$4} END{if(n) printf "нагрузка:      новых соединений в минуту: %.1f (среднее за %d замеров), активных сейчас: %s\n", s/n, n, a}'
+  if [ -s /var/log/chain-incidents.log ]; then echo "сбои (3 последних, всё: chain-incident --show):"; tail -n 3 /var/log/chain-incidents.log | sed 's/^/  /'; else echo "сбои:         записей нет"; fi
   exit 0
 fi
 mkdir -p "$(dirname "$H")"
@@ -3952,21 +3905,172 @@ PY
   [ "$code" = 204 ] || [[ "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]
 }
 
+# просим BACKEND перезапустить мост (ключ разрешает на BACKEND только эту команду); не чаще 4 раз в час
+repair() {
+  local ip port out rc n
+  ip=$(get BACKEND_IP); port=$(get BACKEND_PORT)
+  if systemctl cat chain-bridge >/dev/null 2>&1; then   # BACKEND на этом же сервере: перезапускаем напрямую
+    systemctl restart chain-bridge; echo "$now" >> "$ST.repairs"; setst grace $((now + 180)); setst ef 0
+    inc "мост" "мост перезапущен на этом сервере" "причина: $1"; return 0
+  fi
+  n=$(awk -v t="$now" '$1 > t-3600' "$ST.repairs" 2>/dev/null | wc -l)
+  if [ "$n" -ge 4 ]; then inc "мост" "автоперезапуск моста пропущен" "уже было 4 перезапуска за последний час"; setst grace $((now + 600)); return 0; fi
+  if [ -z "$ip" ] || [ ! -r "$RKEY" ]; then inc "мост" "перезапуск моста невозможен" "нет адреса BACKEND в настройках или ключа $RKEY"; setst grace $((now + 900)); return 0; fi
+  rc=0; out=$(timeout 30 ssh -i "$RKEY" -p "${port:-22}" -o BatchMode=yes -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -o ConnectTimeout=10 "root@$ip" "$1" 2>&1) || rc=$?
+  echo "$now" >> "$ST.repairs"; tail -n 20 "$ST.repairs" > "$ST.repairs.tmp" && mv -f "$ST.repairs.tmp" "$ST.repairs"
+  setst grace $((now + 180))
+  if [ "$rc" -eq 0 ]; then
+    inc "мост" "RELAY попросил BACKEND перезапустить мост" "причина: $1"
+    setst ef 0
+  else
+    inc "мост" "не удалось перезапустить мост по SSH" "ssh завершился с кодом $rc: $(printf '%s' "$out" | tail -n 1 | cut -c1-160)"
+  fi
+}
+
+# службы RELAY
+for s in nginx x-ui; do
+  if systemctl is-active --quiet "$s"; then
+    if [ "$(sv "svc_$s")" = fail ]; then inc --ok "$s" "служба снова работает"; setst "svc_$s" ok; fi
+  else
+    setst "svc_$s" fail
+    inc "$s" "служба не работает" "systemctl is-active: $(systemctl is-active "$s" 2>&1 | head -n1)"
+  fi
+done
+
+# соединения моста
 conns=$(ss -tnH state established "( sport = :21444 )" 2>/dev/null | wc -l)
+cf=$(sv cf); cf=${cf:-0}
+if [ "$conns" -ge 1 ]; then
+  [ "$cf" -ge 2 ] && inc --ok "мост" "мост снова подключён к RELAY"
+  cf=0
+else
+  cf=$((cf + 1))
+  [ "$cf" -ge 2 ] && inc "мост" "мост не подключён" "на туннельном пути нет соединений минуту и дольше"
+fi
+setst cf "$cf"
+
+# сквозная проверка (не чаще раза в 2 мин и только при подключённом мосте)
 e2e=$(kv e2e); e2e_ts=$(kv e2e_ts); e2e=${e2e:-unknown}; e2e_ts=${e2e_ts:-0}
 [[ "$e2e_ts" =~ ^[0-9]+$ ]] || e2e_ts=0
-if [ "$conns" -ge 1 ] && [ $((now - e2e_ts)) -ge 120 ]; then
-  e2e_probe; rc=$?
+ef=$(sv ef); ef=${ef:-0}
+if [ "$conns" -ge 1 ] && { [ "${CHAIN_HEALTH_FORCE_E2E:-0}" = 1 ] || [ $((now - e2e_ts)) -ge 120 ]; }; then
+  rc=0; e2e_probe || rc=$?
   case $rc in 0) e2e=ok ;; 1) e2e=fail ;; *) e2e=unknown ;; esac
   e2e_ts=$now
+  if [ "$e2e" = fail ]; then
+    ef=$((ef + 1))
+    inc "цепочка" "сквозная проверка не прошла" "запрос клиент → nginx → мост → интернет не получил ответа"
+  elif [ "$e2e" = ok ]; then
+    [ "$ef" -ge 1 ] && inc --ok "цепочка" "сквозная проверка проходит"
+    ef=0
+  fi
+  setst ef "$ef"
 fi
+
+# нагрузка: новые соединения в минуту (суммарно по nginx, без адресов клиентов)
+stt=$(curl -s --max-time 3 "$STATUS_URL" 2>/dev/null || true)
+acc=$(printf '%s\n' "$stt" | awk 'NR==3{print $1}'); act=$(printf '%s\n' "$stt" | awk '/Active connections/{print $3}')
+if [[ "$acc" =~ ^[0-9]+$ ]]; then
+  pa=$(sv acc); pt=$(sv acc_ts)
+  if [[ "$pa" =~ ^[0-9]+$ ]] && [[ "$pt" =~ ^[0-9]+$ ]] && [ "$now" -gt "$pt" ] && [ "$acc" -ge "$pa" ]; then
+    rate=$(awk -v d=$((acc - pa)) -v s=$((now - pt)) 'BEGIN{printf "%.1f", d*60/s}')
+    printf '%s %s %s %s\n' "$now" "$acc" "$rate" "${act:-0}" >> "$MET"
+    tail -n 240 "$MET" > "$MET.tmp" && mv -f "$MET.tmp" "$MET"
+  fi
+  setst acc "$acc"; setst acc_ts "$now"
+fi
+
+# перезапуск моста: нет соединений ~3 мин или две неудачные сквозные проверки подряд
+grace=$(sv grace); grace=${grace:-0}; ef=$(sv ef); ef=${ef:-0}
+need=""
+[ "$cf" -ge 6 ] && need="no-bridge"
+[ "$ef" -ge 2 ] && need=${need:-e2e-fail}
+if [ -n "$need" ] && [ "$now" -ge "$grace" ]; then repair "$need"; fi
+
 printf 'ts=%s\nconns=%s\ne2e=%s\ne2e_ts=%s\n' "$now" "$conns" "$e2e" "$e2e_ts" > "$H.tmp" && mv -f "$H.tmp" "$H"
 chmod 644 "$H"
 EOT_H
 chmod +x /usr/local/bin/chain-health
+
+cat > /usr/local/bin/chain-certcheck <<'EOT_C'
+#!/bin/bash
+# chain-certcheck — раз в неделю: срок сертификата и пробное продление (certbot renew --dry-run). Результат — в журнал сбоев.
+#   chain-certcheck          полная проверка
+#   chain-certcheck --days   только сколько дней осталось
+conf=${CHAIN_SETUP_CONF:-/root/.chain-setup.conf}
+D=$(sed -n 's/^DOMAIN=//p' "$conf" 2>/dev/null | head -n1)
+cert=/etc/letsencrypt/live/$D/fullchain.pem
+FLAG=/var/lib/chain/cert-failed
+inc() { /usr/local/bin/chain-incident "$@" >/dev/null 2>&1 || true; }
+days() {
+  local end; end=$(openssl x509 -enddate -noout -in "$cert" 2>/dev/null | cut -d= -f2)
+  [ -n "$end" ] || return 1
+  echo $(( ($(date -d "$end" +%s) - $(date +%s)) / 86400 ))
+}
+if [ "${1:-}" = "--days" ]; then days || echo "?"; exit 0; fi
+bad=0
+d=$(days) || { inc "сертификат" "сертификат не найден" "нет файла $cert"; touch "$FLAG"; exit 1; }
+if [ "$d" -lt 21 ]; then inc "сертификат" "срок сертификата истекает" "осталось $d дн.; автопродление должно срабатывать за 30 дн."; bad=1; fi
+rc=0; out=$(timeout 240 certbot renew --dry-run --cert-name "$D" 2>&1) || rc=$?
+if [ "$rc" -ne 0 ]; then
+  inc "сертификат" "пробное продление не прошло" "certbot: $(printf '%s' "$out" | grep -aiE 'error|fail|timeout|connection|unauthorized|detail' | tail -n 1 | cut -c1-200)"
+  bad=1
+fi
+if [ "$bad" -eq 0 ]; then
+  [ -e "$FLAG" ] && inc --ok "сертификат" "срок $d дн., пробное продление проходит"
+  rm -f "$FLAG"
+else touch "$FLAG"; fi
+exit "$bad"
+EOT_C
+chmod +x /usr/local/bin/chain-certcheck
+
+cat > /usr/local/bin/chain-boot-test <<'EOT_B'
+#!/bin/bash
+# chain-boot-test — автотест после перезагрузки RELAY: службы, мост, сквозная проверка, «без моста нет выхода», срок сертификата.
+# Итог пишется в /var/log/chain-incidents.log (компонент «автотест»).
+inc() { /usr/local/bin/chain-incident "$@" >/dev/null 2>&1 || true; }
+bad=0
+for i in $(seq 1 36); do systemctl is-active --quiet nginx && systemctl is-active --quiet x-ui && break; sleep 5; done
+for s in nginx x-ui; do
+  systemctl is-active --quiet "$s" || { inc "автотест" "после перезагрузки $s не запустился" "systemctl is-active: $(systemctl is-active "$s" 2>&1 | head -n1)"; bad=1; }
+done
+c=0
+for i in $(seq 1 48); do c=$(ss -tnH state established "( sport = :21444 )" 2>/dev/null | wc -l); [ "$c" -ge 1 ] && break; sleep 5; done
+if [ "$c" -lt 1 ]; then
+  inc "автотест" "после перезагрузки мост не подключился за 4 минуты" "соединений на туннельном пути нет; BACKEND мог ещё не запуститься или нет связи"
+  bad=1
+else
+  CHAIN_HEALTH_FORCE_E2E=1 /usr/local/bin/chain-health || true
+  e=$(sed -n 's/^e2e=//p' /var/lib/chain/health 2>/dev/null | head -n1)
+  [ "$e" = ok ] || { inc "автотест" "после перезагрузки сквозная проверка не прошла" "результат проверки: ${e:-нет данных}"; bad=1; }
+fi
+if [ -x /usr/local/bin/chain-failclosed ]; then
+  rc=0; /usr/local/bin/chain-failclosed --quiet || rc=$?
+  case $rc in
+    0) ;;
+    1) inc "автотест" "УТЕЧКА: без моста трафик пользователей выходит с IP RELAY" "проверка chain-failclosed вернула «выход есть»"; bad=1 ;;
+    *) inc "автотест" "проверка «без моста нет выхода» не выполнена" "chain-failclosed завершилась с кодом $rc (запустите вручную для подробностей)"; bad=1 ;;
+  esac
+fi
+d=$(/usr/local/bin/chain-certcheck --days 2>/dev/null)
+if [[ "$d" =~ ^-?[0-9]+$ ]] && [ "$d" -lt 14 ]; then inc "автотест" "срок сертификата меньше 14 дней" "осталось $d дн."; bad=1; fi
+[ "$bad" -eq 0 ] && inc --ok "автотест" "после перезагрузки всё в порядке"
+exit 0
+EOT_B
+chmod +x /usr/local/bin/chain-boot-test
+
+cat > /etc/nginx/conf.d/chain-status.conf <<'EOT_N'
+# служебный счётчик соединений nginx (только localhost) — для chain-health
+server {
+    listen 127.0.0.1:21480;
+    access_log off;
+    location = /nginx_status { stub_status; allow 127.0.0.1; deny all; }
+}
+EOT_N
+
 cat > /etc/systemd/system/chain-health.service <<'EOT_S'
 [Unit]
-Description=chain health (состояние туннеля для сторожа BACKEND)
+Description=chain health (состояние цепочки на RELAY)
 
 [Service]
 Type=oneshot
@@ -3984,10 +4088,50 @@ AccuracySec=5
 [Install]
 WantedBy=timers.target
 EOT_T
+cat > /etc/systemd/system/chain-certcheck.service <<'EOT_S'
+[Unit]
+Description=chain: проверка срока и продления сертификата
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/chain-certcheck
+EOT_S
+cat > /etc/systemd/system/chain-certcheck.timer <<'EOT_T'
+[Unit]
+Description=chain: проверка сертификата раз в неделю
+
+[Timer]
+OnCalendar=weekly
+RandomizedDelaySec=6h
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+EOT_T
+cat > /etc/systemd/system/chain-boot-test.service <<'EOT_S'
+[Unit]
+Description=chain: автотест после перезагрузки
+After=network-online.target nginx.service x-ui.service
+
+[Service]
+Type=oneshot
+TimeoutStartSec=900
+ExecStart=/usr/local/bin/chain-boot-test
+EOT_S
+cat > /etc/systemd/system/chain-boot-test.timer <<'EOT_T'
+[Unit]
+Description=chain: автотест через 3 минуты после запуска системы
+
+[Timer]
+OnBootSec=3min
+
+[Install]
+WantedBy=timers.target
+EOT_T
 cp -p "$F" "$F.bak-health"
 if ! python3 - "$F" "$VPATH" <<'PY'
 # Обновляет конфиг nginx RELAY: (1) путь версии Xray отдаёт файл через root+try_files (alias на файл без «/» давал 500
-# из-за обработчика index); (2) добавляет путь состояния туннеля для сторожа BACKEND (только с IP BACKEND).
+# из-за обработчика index); (2) убирает путь состояния /health (в 4.3 BACKEND RELAY не опрашивает).
 # Идемпотентно. Код возврата: 0 — готово, 2 — не найден блок версии Xray.
 import re, sys
 f, vp = sys.argv[1], sys.argv[2]
@@ -4003,18 +4147,11 @@ out = s[:m.start()] + fixed + s[m.end():]
 done = []
 if fixed != ver:
     done.append("путь версии исправлен")
-if "location = /%s/health {" % vp not in out:
-    m = re.search(pat, out, re.S)
-    block = ("\n    # Состояние туннеля для сторожа моста BACKEND (доступно только с IP BACKEND)\n"
-             "    location = /%s/health {\n"
-             "        include /etc/nginx/chain-backend.conf;\n"
-             "        error_page 403 =404 /404.html;\n"
-             "        default_type text/plain;\n"
-             "        add_header Cache-Control \"no-store\" always;\n"
-             "        alias /var/lib/chain/health;\n"
-             "    }\n") % vp
-    out = out[:m.end()] + block + out[m.end():]
-    done.append("добавлен путь состояния")
+hp = r"\n    # Состояние туннеля для сторожа моста BACKEND[^\n]*\n    location = /%s/health \{.*?\n    \}\n" % re.escape(vp)
+out2 = re.sub(hp, "\n", out, flags=re.S)
+if out2 != out:
+    done.append("путь /health убран")
+    out = out2
 if out != s:
     open(f, "w").write(out)
 print(", ".join(done) or "уже актуально")
@@ -4026,55 +4163,71 @@ if nginx -t >/dev/null 2>&1; then
   systemctl reload nginx
   rm -f "$F.bak-health"
 else
-  cp -p "$F.bak-health" "$F"; nginx -t >&2 || true; echo "nginx -t не прошёл, конфиг возвращён" >&2; exit 1
+  cp -p "$F.bak-health" "$F"; rm -f /etc/nginx/conf.d/chain-status.conf; nginx -t >&2 || true; echo "nginx -t не прошёл, конфиг возвращён" >&2; exit 1
 fi
 if [ -f /usr/local/bin/chain-status ] && ! grep -q 'chain-health --show' /usr/local/bin/chain-status; then
   printf '%s\n' '[ -x /usr/local/bin/chain-health ] && /usr/local/bin/chain-health --show' >> /usr/local/bin/chain-status
 fi
 systemctl daemon-reload
-systemctl enable --now chain-health.timer >/dev/null 2>&1
+systemctl enable --now chain-health.timer chain-certcheck.timer chain-boot-test.timer >/dev/null 2>&1
 /usr/local/bin/chain-health || true
-EOF
+__CHAIN_EOF__
 
-  # BACKEND: keepalive HTTP/2 для моста и сторож chain-watchdog (раз в минуту со случайным разбросом); идемпотентно, подходит и для уже установленного моста
-  cat > "$D/watchdog-install.sh" <<'EOF'
+  # BACKEND: локальный сторож chain-watchdog (раз в минуту, в сеть ничего не отправляет), chain-restart-bridge (команда для ключа RELAY), keepalive HTTP/2 и защита моста; идемпотентно, подходит и для уже установленного моста
+  cat > "$D/watchdog-install.sh" <<'__CHAIN_EOF__'
 set -Eeuo pipefail
 CF=/etc/chain-bridge/config.json
 [ -f "$CF" ] && [ -f /etc/chain-bridge/sync.conf ] && [ -x /usr/local/bin/chain-xray ] || { echo "мост chain-bridge не установлен" >&2; exit 1; }
 NEW="${CF%.json}.next.json"   # Xray определяет формат по расширению: временный файл тоже *.json
 changed=$(python3 - "$CF" "$NEW" <<'PY'
-import json, sys
+import json, re, subprocess, sys
 f = sys.argv[1]
 c = json.load(open(f))
+changed = 0
 xm = c["outbounds"][0]["streamSettings"]["xhttpSettings"].setdefault("xmux", {})
-if "hKeepAlivePeriod" in xm:
-    print(0)
-else:
+if "hKeepAlivePeriod" not in xm:
     xm["hKeepAlivePeriod"] = 15
+    changed = 1
+# свои публичные адреса BACKEND — в список запретов выхода (через туннель нельзя обращаться к самому серверу по его внешнему IP)
+own = []
+for fam, plen in (("inet", 32), ("inet6", 128)):
+    out = subprocess.run(["ip", "-o", "-" + ("4" if fam == "inet" else "6"), "addr", "show", "scope", "global"], capture_output=True, text=True).stdout
+    for m in re.finditer(r"\b%s\s+([0-9a-fA-F:.]+)/\d+" % fam, out):
+        own.append("%s/%d" % (m.group(1), plen))
+for o in c["outbounds"]:
+    if o.get("tag") == "direct":
+        fr = o.get("settings", {}).get("finalRules", [])
+        if fr and fr[0].get("action") == "block":
+            have = set(fr[0].get("ip", []))
+            add = [a for a in own if a not in have]
+            if add:
+                fr[0]["ip"] = fr[0].get("ip", []) + add
+                changed = 1
+if changed:
     json.dump(c, open(sys.argv[2], "w"), indent=2)
-    print(1)
+print(changed)
 PY
 )
 if [ "$changed" = 1 ]; then
   chown --reference="$CF" "$NEW"; chmod --reference="$CF" "$NEW"
-  if /usr/local/bin/chain-xray run -test -c "$NEW" >/dev/null 2>&1; then mv -f "$NEW" "$CF"; else rm -f "$NEW"; echo "конфиг моста с keepalive не прошёл проверку Xray" >&2; exit 1; fi
+  if /usr/local/bin/chain-xray run -test -c "$NEW" >/dev/null 2>&1; then mv -f "$NEW" "$CF"; else rm -f "$NEW"; echo "обновлённый конфиг моста не прошёл проверку Xray" >&2; exit 1; fi
 fi
 mkdir -p /var/lib/chain-bridge/watchdog
 cat > /usr/local/bin/chain-watchdog <<'EOT_WD'
 #!/bin/bash
-# chain-watchdog — сторож моста (BACKEND). Раз в минуту (с разбросом до 30 с, чтобы не было «метронома» на границе)
-# читает у RELAY состояние туннеля (его пишет chain-health).
-# Перезапускает chain-bridge, только если RELAY доступен, но не видит мост (2 проверки подряд, около 2–3 мин)
-# или сквозная проверка на RELAY провалилась 2 раза подряд (около 4–5 мин). Недоступность RELAY и устаревшее
-# состояние — не повод: перезапуск моста тут не поможет. Не чаще раза в 3 мин и не больше 4 раз в час.
+# chain-watchdog — сторож моста (BACKEND). Раз в минуту смотрит ТОЛЬКО на этот сервер, в сеть ничего не отправляет:
+# жива ли служба chain-bridge и есть ли установленное соединение моста с RELAY:443.
+# Нет соединения 2 минуты — запись в журнал сбоев с причиной; 3 минуты — перезапуск моста (не чаще раза в 3 мин и не больше 4 раз в час).
+# Состояние RELAY проверяет сам RELAY (chain-health) и при необходимости просит перезапустить мост (chain-restart-bridge).
 #   chain-watchdog            одна проверка (запускается таймером)
-#   chain-watchdog --status   последнее решение и история перезапусков
+#   chain-watchdog --status   последнее состояние и история перезапусков
 CONF=${CHAIN_BRIDGE_CONF:-/etc/chain-bridge/sync.conf}
 S=${CHAIN_WD_STATE:-/var/lib/chain-bridge/watchdog}
 now=${CHAIN_WD_NOW:-$(date +%s)}
 get() { sed -n "s/^$1=//p" "$CONF" 2>/dev/null | head -n1; }
 sv() { sed -n "s/^$1=//p" "$S/state" 2>/dev/null | head -n1; }
 num() { [[ "${1:-}" =~ ^[0-9]+$ ]]; }
+inc() { /usr/local/bin/chain-incident "$@" >/dev/null 2>&1 || true; }
 mkdir -p "$S"
 if [ "${1:-}" = "--status" ]; then
   if [ -r "$S/state" ]; then cat "$S/state"; else echo "состояния ещё нет"; fi
@@ -4082,59 +4235,76 @@ if [ "${1:-}" = "--status" ]; then
   echo "последние перезапуски:"; tail -n 5 "$S/restarts" 2>/dev/null | while read -r t why; do echo "  $(date -d "@$t" '+%F %T') $why"; done
   exit 0
 fi
-RELAY_IP=$(get RELAY_IP); DOMAIN=$(get DOMAIN); VPATH=$(get VPATH)
-[ -n "$RELAY_IP" ] && [ -n "$DOMAIN" ] && [ -n "$VPATH" ] || exit 0
-systemctl is-active --quiet chain-bridge || exit 0     # мост остановлен вручную — не вмешиваемся
-
-verdict=ok; reason=""
-cf=$(sv conn_fails); ef=$(sv e2e_fails); seen=$(sv e2e_seen); grace=$(sv grace_until)
-num "$cf" || cf=0; num "$ef" || ef=0; num "$seen" || seen=0; num "$grace" || grace=0
-body=$(curl -fsS --max-time 8 --resolve "$DOMAIN:443:$RELAY_IP" "https://$DOMAIN/$VPATH/health" 2>/dev/null) || body=""
-g() { printf '%s\n' "$body" | sed -n "s/^$1=//p" | head -n1; }
-ts=$(g ts); conns=$(g conns); e2e=$(g e2e); e2et=$(g e2e_ts)
-if [ -z "$body" ]; then
-  verdict=relay-unreachable
-elif ! num "$ts" || ! num "$conns"; then
-  verdict=bad-response
-elif [ $((now - ts)) -gt 180 ]; then
-  verdict=health-stale
-elif [ "$now" -lt "$grace" ]; then
-  verdict=grace      # после перезапуска моста даём время подключиться
+RELAY_IP=$(get RELAY_IP)
+[ -n "$RELAY_IP" ] || exit 0
+cf=$(sv conn_fails); grace=$(sv grace_until); dn=$(sv down)
+num "$cf" || cf=0; num "$grace" || grace=0; [ "$dn" = 1 ] || dn=0
+verdict=ok
+if systemctl is-failed --quiet chain-bridge; then
+  inc "мост" "служба chain-bridge в состоянии failed" "последняя ошибка: $(journalctl -u chain-bridge -n 20 --no-pager -o cat 2>/dev/null | grep -aiE 'error|fail|timeout|refused|reset' | tail -n 1 | cut -c1-160)"
+  systemctl restart chain-bridge; verdict=restarted-failed; grace=$((now + 180))
+elif ! systemctl is-active --quiet chain-bridge; then
+  verdict=stopped      # мост остановлен вручную — не вмешиваемся
+  cf=0
 else
-  if [ "$conns" -lt 1 ]; then cf=$((cf + 1)); reason="RELAY не видит мост ($cf)"; else cf=0; fi
-  if num "$e2et" && [ $((now - e2et)) -le 300 ] && [ "$e2et" != "$seen" ]; then
-    seen=$e2et
-    case "$e2e" in
-      fail) ef=$((ef + 1)); reason="${reason:+$reason; }сквозная проверка не прошла ($ef)" ;;
-      ok) ef=0 ;;
-    esac
-  fi
-  [ "$cf" -eq 0 ] && [ "$ef" -eq 0 ] || verdict=failing
-fi
-if [ "$verdict" = failing ] && { [ "$cf" -ge 2 ] || [ "$ef" -ge 2 ]; }; then
-  last=$(tail -n 1 "$S/restarts" 2>/dev/null | awk '{print $1}'); num "$last" || last=0
-  recent=$(awk -v n="$now" '$1 > n - 3600' "$S/restarts" 2>/dev/null | wc -l)
-  if [ $((now - last)) -lt 180 ]; then
-    verdict=cooldown
-  elif [ "$recent" -ge 4 ]; then
-    verdict=rate-limited; logger -t chain-watchdog "мост не восстанавливается: уже $recent перезапусков за час, жду"
+  conns=$(ss -tnH state established "( dst $RELAY_IP and dport = :443 )" 2>/dev/null | wc -l)
+  if [ "$conns" -ge 1 ]; then
+    [ "$dn" = 1 ] && inc --ok "мост" "соединение моста с RELAY восстановлено"
+    cf=0; dn=0
+  elif [ "$now" -lt "$grace" ]; then
+    verdict=grace      # после перезапуска даём время подключиться
   else
-    logger -t chain-watchdog "перезапуск chain-bridge: $reason"
-    echo "$now $reason" >> "$S/restarts"; tail -n 50 "$S/restarts" > "$S/restarts.tmp" && mv -f "$S/restarts.tmp" "$S/restarts"
-    systemctl restart chain-bridge
-    cf=0; ef=0; grace=$((now + 180)); verdict=restarted
+    cf=$((cf + 1)); verdict=failing
+    if [ "$cf" -ge 2 ]; then
+      rc=0; timeout 5 bash -c "exec 3<>/dev/tcp/$RELAY_IP/443" 2>/dev/null || rc=$?
+      case $rc in 0) tcp="TCP до RELAY:443 открывается, но мост соединение не держит" ;; 124) tcp="TCP до RELAY:443: нет ответа (таймаут)" ;; *) tcp="TCP до RELAY:443 не открывается (отказ или сброс)" ;; esac
+      dn=1
+      inc "мост" "нет соединения моста с RELAY" "$tcp; последняя ошибка моста: $(journalctl -u chain-bridge -n 20 --no-pager -o cat 2>/dev/null | grep -aiE 'error|fail|timeout|refused|reset' | tail -n 1 | cut -c1-120)"
+    fi
+    if [ "$cf" -ge 3 ]; then
+      last=$(tail -n 1 "$S/restarts" 2>/dev/null | awk '{print $1}'); num "$last" || last=0
+      recent=$(awk -v n="$now" '$1 > n - 3600' "$S/restarts" 2>/dev/null | wc -l)
+      if [ $((now - last)) -lt 180 ]; then
+        verdict=cooldown
+      elif [ "$recent" -ge 4 ]; then
+        verdict=rate-limited; inc "мост" "автоперезапуск моста пропущен" "уже было 4 перезапуска за последний час"
+      else
+        echo "$now no-connection" >> "$S/restarts"; tail -n 50 "$S/restarts" > "$S/restarts.tmp" && mv -f "$S/restarts.tmp" "$S/restarts"
+        inc "мост" "мост перезапущен сторожем" "соединения с RELAY нет 3 минуты"
+        systemctl restart chain-bridge
+        cf=0; grace=$((now + 180)); verdict=restarted
+      fi
+    fi
   fi
 fi
-prev=$(sv verdict)
-[ "$verdict" = "$prev" ] || [ "$verdict" = ok ] || logger -t chain-watchdog "состояние: $verdict${reason:+ ($reason)}"
-{ echo "verdict=$verdict"; echo "checked=$now"; echo "relay_conns=${conns:-?}"; echo "e2e=${e2e:-?}"
-  echo "conn_fails=$cf"; echo "e2e_fails=$ef"; echo "e2e_seen=$seen"; echo "grace_until=$grace"; } > "$S/state.tmp" && mv -f "$S/state.tmp" "$S/state"
+{ echo "verdict=$verdict"; echo "checked=$now"; echo "conn_fails=$cf"; echo "grace_until=$grace"; echo "down=$dn"; } > "$S/state.tmp" && mv -f "$S/state.tmp" "$S/state"
 exit 0
 EOT_WD
 chmod +x /usr/local/bin/chain-watchdog
+cat > /usr/local/bin/chain-restart-bridge <<'EOT_RB'
+#!/bin/bash
+# chain-restart-bridge — единственная команда, которую SSH-ключу RELAY (chain-restart) разрешено выполнять на BACKEND: перезапуск моста.
+reason=${SSH_ORIGINAL_COMMAND:-}
+[ "$reason" = ping ] && { echo "ключ работает"; exit 0; }
+case "$reason" in
+  no-bridge) why="RELAY не видит соединений моста" ;;
+  e2e-fail) why="сквозная проверка на RELAY не прошла" ;;
+  *) why="по запросу RELAY" ;;
+esac
+S=/var/lib/chain-bridge/watchdog; mkdir -p "$S"
+now=$(date +%s)
+last=$(tail -n 1 "$S/restarts" 2>/dev/null | awk '{print $1}'); [[ "$last" =~ ^[0-9]+$ ]] || last=0
+if [ $((now - last)) -lt 120 ]; then echo "перезапуск пропущен: мост перезапускали менее 2 минут назад"; exit 0; fi
+echo "$now relay:${reason:-request}" >> "$S/restarts"; tail -n 50 "$S/restarts" > "$S/restarts.tmp" && mv -f "$S/restarts.tmp" "$S/restarts"
+/usr/local/bin/chain-incident "мост" "мост перезапущен по запросу RELAY" "$why" >/dev/null 2>&1 || true
+systemctl restart chain-bridge
+sleep 2
+systemctl is-active --quiet chain-bridge && echo "мост перезапущен" || { echo "мост не запустился"; exit 1; }
+EOT_RB
+chmod +x /usr/local/bin/chain-restart-bridge
 cat > /etc/systemd/system/chain-watchdog.service <<'EOT_S'
 [Unit]
-Description=chain watchdog (сторож моста)
+Description=chain watchdog (сторож моста, локальные проверки)
 
 [Service]
 Type=oneshot
@@ -4142,12 +4312,11 @@ ExecStart=/usr/local/bin/chain-watchdog
 EOT_S
 cat > /etc/systemd/system/chain-watchdog.timer <<'EOT_T'
 [Unit]
-Description=chain watchdog: раз в минуту со случайным разбросом
+Description=chain watchdog: раз в минуту (в сеть ничего не отправляет)
 
 [Timer]
 OnBootSec=120
 OnUnitActiveSec=60
-RandomizedDelaySec=30
 AccuracySec=5
 
 [Install]
@@ -4160,7 +4329,744 @@ if [ "$changed" = 1 ]; then
   sleep 3
   systemctl is-active --quiet chain-bridge
 fi
-EOF
+__CHAIN_EOF__
+
+  cat > "$D/incident-install.sh" <<'__CHAIN_EOF_INCIDENT_INSTALL_SH__'
+set -e
+mkdir -p /var/lib/chain-incident
+cat > /usr/local/bin/chain-incident <<'EOT'
+#!/bin/bash
+# chain-incident — журнал сбоев цепочки: /var/log/chain-incidents.log
+#   chain-incident КОМПОНЕНТ "что произошло" "причина"   записать сбой (то же самое чаще раза в 30 мин не дублируется)
+#   chain-incident --ok КОМПОНЕНТ "что восстановилось"    записать восстановление
+#   chain-incident --show [N]                             последние N записей (по умолчанию 30)
+F=${CHAIN_INCIDENT_LOG:-/var/log/chain-incidents.log}
+S=${CHAIN_INCIDENT_STATE:-/var/lib/chain-incident}
+MARK=${CHAIN_MARKER_FILE:-/root/.chain-setup.installed}
+role=$(sed -n 's/^ROLE=//p' "$MARK" 2>/dev/null | head -n1); role=${role:-relay}
+clean() { printf '%s' "$*" | tr '\n\r|' '   ' | tr -d '\000-\010\013\014\016-\037' | cut -c1-300; }
+h() { printf '%s' "$1" | md5sum | cut -c1-8; }
+if [ "${1:-}" = "--show" ]; then tail -n "${2:-30}" "$F" 2>/dev/null || true; [ -s "$F" ] || echo "записей нет"; exit 0; fi
+mkdir -p "$S" "$(dirname "$F")"
+[ -e "$F" ] || { : > "$F"; chmod 600 "$F"; }
+now=${CHAIN_INCIDENT_NOW:-$(date +%s)}
+ts=$(date -d "@$now" '+%F %T')
+if [ "${1:-}" = "--ok" ]; then
+  comp=$(clean "${2:-?}"); what=$(clean "${3:-восстановлено}")
+  rm -f "$S/$(h "$comp")"-* 2>/dev/null
+  printf '%s | %s | %s | ВОССТАНОВЛЕНО: %s | —\n' "$ts" "${role^^}" "$comp" "$what" >> "$F"
+  exit 0
+fi
+comp=$(clean "${1:-?}"); what=$(clean "${2:-?}"); why=$(clean "${3:-причина не определена}")
+k="$S/$(h "$comp")-$(h "$what|$why")"
+if [ -f "$k" ] && [ $((now - $(cat "$k" 2>/dev/null || echo 0))) -lt 1800 ]; then exit 0; fi
+printf '%s\n' "$now" > "$k"
+printf '%s | %s | %s | %s | %s\n' "$ts" "${role^^}" "$comp" "$what" "$why" >> "$F"
+exit 0
+EOT
+chmod +x /usr/local/bin/chain-incident
+cat > /etc/logrotate.d/chain-incidents <<'EOT'
+/var/log/chain-incidents.log {
+    weekly
+    rotate 8
+    compress
+    missingok
+    notifempty
+    create 600 root root
+}
+EOT
+[ -e /var/log/chain-incidents.log ] || { : > /var/log/chain-incidents.log; chmod 600 /var/log/chain-incidents.log; }
+__CHAIN_EOF_INCIDENT_INSTALL_SH__
+
+  cat > "$D/bridge-tools.sh" <<'__CHAIN_EOF_BRIDGE_TOOLS_SH__'
+set -Eeuo pipefail
+[ -f /etc/chain-bridge/config.json ] && [ -x /usr/local/bin/chain-xray ] || { echo "мост chain-bridge не установлен" >&2; exit 1; }
+cat > /usr/local/bin/chain-update-bridge <<'EOT'
+#!/bin/bash
+# chain-update-bridge — версия Xray моста (только вручную, по таймеру ничего не опрашивается)
+#   chain-update-bridge 26.10.31   установить указанную версию (прежняя сохраняется; если мост не подключился — автоматический откат)
+#   chain-update-bridge            привести Xray моста к версии RELAY (если RELAY отвечает)
+#   chain-update-bridge --rollback вернуть версию, сохранённую при последнем обновлении
+#   chain-update-bridge --status   показать версии на BACKEND и RELAY
+CONF=/etc/chain-bridge/sync.conf; BIN=/usr/local/bin/chain-xray
+get() { sed -n "s/^$1=//p" "$CONF" 2>/dev/null | head -n1; }
+RELAY_IP=$(get RELAY_IP); DOMAIN=$(get DOMAIN); VPATH=$(get VPATH)
+log() { logger -t chain-update "$*"; echo "$(date '+%F %T') $*"; }
+inc() { /usr/local/bin/chain-incident "$@" >/dev/null 2>&1 || true; }
+cur=$("$BIN" version 2>/dev/null | awk 'NR==1{print $2}')
+remote() {
+  [ -n "$RELAY_IP" ] && [ -n "$DOMAIN" ] && [ -n "$VPATH" ] || return 1
+  curl -fsS --max-time 15 --resolve "$DOMAIN:443:$RELAY_IP" "https://$DOMAIN/$VPATH/" 2>/dev/null | tr -d '[:space:]'
+}
+valid() { [[ "$1" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; }
+wait_conn() { local _; for _ in $(seq 1 25); do sleep 1; if systemctl is-active --quiet chain-bridge && ss -tnH state established "( dst $RELAY_IP and dport = :443 )" 2>/dev/null | grep -q .; then return 0; fi; done; return 1; }
+mode="${1:-sync}"
+case "$mode" in
+  --status | status)
+    r=$(remote)
+    echo "Xray на BACKEND: ${cur:-?}"
+    echo "Xray на RELAY:   ${r:-недоступно}"
+    [ -x "$BIN.prev" ] && echo "сохранённая предыдущая версия: $("$BIN.prev" version 2>/dev/null | awk 'NR==1{print $2}')"
+    exit 0 ;;
+  --rollback)
+    [ -x "$BIN.prev" ] || { echo "предыдущей версии нет ($BIN.prev)"; exit 1; }
+    pv=$("$BIN.prev" version 2>/dev/null | awk 'NR==1{print $2}')
+    mv -f "$BIN.prev" "$BIN"; systemctl restart chain-bridge
+    if wait_conn; then log "откат выполнен: ${cur:-?} -> ${pv:-?}"; inc "обновление Xray" "Xray моста возвращён на предыдущую версию" "${cur:-?} -> ${pv:-?} по запросу"; exit 0; fi
+    log "ОШИБКА: после отката на ${pv:-?} мост не подключился"; inc "обновление Xray" "после отката мост не подключился" "версия ${pv:-?}"; exit 1 ;;
+  sync) target=$(remote) || { echo "RELAY недоступен: версия не получена"; exit 1; }; valid "$target" || { echo "RELAY вернул неверную версию"; exit 1; } ;;
+  *) target="${mode#v}"; valid "$target" || { echo "использование: chain-update-bridge [ВЕРСИЯ|--rollback|--status]"; exit 1; } ;;
+esac
+if [ "$target" = "$cur" ]; then echo "уже установлена версия $cur"; exit 0; fi
+exec 9>/run/chain-update.lock
+flock -n 9 || exit 0
+case "$(uname -m)" in x86_64 | amd64) ARCH=64 ;; aarch64 | arm64) ARCH=arm64-v8a ;; *) log "неподдерживаемая архитектура"; exit 1 ;; esac
+tmp=$(mktemp -d); trap 'rm -rf "$tmp"' EXIT
+URL="https://github.com/XTLS/Xray-core/releases/download/v$target/Xray-linux-$ARCH.zip"
+if ! curl -fsSL --retry 3 --max-time 300 -o "$tmp/x.zip" "$URL" || ! curl -fsSL --retry 3 --max-time 60 -o "$tmp/x.dgst" "$URL.dgst"; then
+  log "версия $target недоступна на GitHub — пропуск"; inc "обновление Xray" "версия $target не скачана" "GitHub не отдал файл или нет связи"; exit 1
+fi
+want=$(sed -n 's/^SHA2-256= *//p' "$tmp/x.dgst" | head -n1 | tr -d '[:space:]')
+have=$(sha256sum "$tmp/x.zip" | awk '{ print $1 }')
+[ -n "$want" ] && [ "$want" = "$have" ] || { log "контрольная сумма $target не совпала — отмена"; inc "обновление Xray" "контрольная сумма $target не совпала" "обновление отменено"; exit 1; }
+unzip -oq "$tmp/x.zip" xray -d "$tmp" || { log "не удалось распаковать $target"; exit 1; }
+"$tmp/xray" run -test -c /etc/chain-bridge/config.json >/dev/null 2>&1 || { log "конфиг моста не проходит проверку версией $target — отмена"; inc "обновление Xray" "версия $target не приняла конфиг моста" "обновление отменено"; exit 1; }
+cp -f "$BIN" "$BIN.prev"
+install -m 755 "$tmp/xray" "$BIN.new" && mv -f "$BIN.new" "$BIN"
+systemctl restart chain-bridge
+if wait_conn; then
+  log "Xray обновлён: ${cur:-?} -> $target (предыдущая версия сохранена: chain-update-bridge --rollback)"
+else
+  mv -f "$BIN.prev" "$BIN"
+  systemctl restart chain-bridge
+  log "ОШИБКА: мост не подключился на версии $target — выполнен откат на ${cur:-?}"
+  inc "обновление Xray" "мост не подключился на версии $target" "автоматически выполнен откат на ${cur:-?}"
+  exit 1
+fi
+EOT
+chmod +x /usr/local/bin/chain-update-bridge
+cat > /usr/local/bin/chain-set-relay <<'EOT'
+#!/bin/bash
+# chain-set-relay НОВЫЙ_IP_RELAY — сменить адрес RELAY у моста. Если мост не подключится к новому адресу за 40 с, прежний адрес возвращается.
+CF=/etc/chain-bridge/config.json; SC=/etc/chain-bridge/sync.conf
+NEW="${1:-}"; [ -n "$NEW" ] || { echo "usage: chain-set-relay НОВЫЙ_IP_RELAY"; exit 1; }
+[[ "$NEW" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "неверный IP"; exit 1; }
+inc() { /usr/local/bin/chain-incident "$@" >/dev/null 2>&1 || true; }
+setip() {
+  python3 - "$1" <<'PY'
+import json, sys
+f = "/etc/chain-bridge/config.json"
+c = json.load(open(f))
+old = c["outbounds"][0]["settings"]["address"]
+c["outbounds"][0]["settings"]["address"] = sys.argv[1]
+json.dump(c, open(f, "w"), indent=2)
+print(old)
+PY
+}
+old=$(setip "$NEW") || { echo "не удалось изменить конфиг моста"; exit 1; }
+echo "RELAY: $old -> $NEW"
+sed -i "s/^RELAY_IP=.*/RELAY_IP=$NEW/" "$SC" 2>/dev/null || true
+systemctl restart chain-bridge
+ok=0
+for _ in $(seq 1 40); do
+  sleep 1
+  if systemctl is-active --quiet chain-bridge && ss -tnH state established "( dst $NEW and dport = :443 )" 2>/dev/null | grep -q .; then ok=1; break; fi
+done
+if [ "$ok" -eq 1 ]; then echo "готово: мост подключён к $NEW"; exit 0; fi
+setip "$old" >/dev/null
+sed -i "s/^RELAY_IP=.*/RELAY_IP=$old/" "$SC" 2>/dev/null || true
+systemctl restart chain-bridge
+inc "мост" "смена адреса RELAY отменена" "мост не подключился к $NEW за 40 с; возвращён адрес $old"
+echo "мост не подключился к $NEW за 40 с — возвращён прежний адрес $old"
+exit 1
+EOT
+chmod +x /usr/local/bin/chain-set-relay
+__CHAIN_EOF_BRIDGE_TOOLS_SH__
+
+  cat > "$D/restart-key-install.sh" <<'__CHAIN_EOF_RESTART_KEY_INSTALL_SH__'
+set -Eeuo pipefail
+pub=$(printf '%s' "${1:?не передан ключ}" | base64 -d)
+[[ "$pub" =~ ^ssh-ed25519\ [A-Za-z0-9+/=]+(\ [^[:space:]]+)?$ ]] || { echo "некорректный публичный ключ" >&2; exit 1; }
+[ -x /usr/local/bin/chain-restart-bridge ] || { echo "нет /usr/local/bin/chain-restart-bridge (установите сторож моста)" >&2; exit 1; }
+mkdir -p /root/.ssh; chmod 700 /root/.ssh
+touch /root/.ssh/authorized_keys; chmod 600 /root/.ssh/authorized_keys
+sed -i '/ chain-restart@/d' /root/.ssh/authorized_keys
+printf 'restrict,command="/usr/local/bin/chain-restart-bridge" %s\n' "$pub" >> /root/.ssh/authorized_keys
+__CHAIN_EOF_RESTART_KEY_INSTALL_SH__
+
+  cat > "$D/xray-update-relay.sh" <<'__CHAIN_EOF_XRAY_UPDATE_RELAY_SH__'
+set -Eeuo pipefail
+# Обновление ядра Xray внутри 3x-ui на RELAY: prepare (скачать, проверить, прогнать проверки на новой версии) → apply (заменить с сохранением прежней) → rollback.
+cmd="${1:?prepare|apply|rollback}"; V="${2:-}"; V="${V#v}"
+BIN=""; for b in /usr/local/x-ui/bin/xray-linux-*; do case "$b" in *.prev) continue ;; esac; BIN=$b; break; done
+[ -n "$BIN" ] && [ -x "$BIN" ] || { echo "Xray из 3x-ui не найден" >&2; exit 1; }
+NEWD=/var/lib/chain/xray-new
+inc() { /usr/local/bin/chain-incident "$@" >/dev/null 2>&1 || true; }
+wait_up() { local _; for _ in $(seq 1 40); do sleep 1; if systemctl is-active --quiet x-ui && ss -tlnH "( sport = :21443 )" 2>/dev/null | grep -q .; then return 0; fi; done; return 1; }
+case "$cmd" in
+  prepare)
+    [[ "$V" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "неверная версия Xray: $V" >&2; exit 1; }
+    case "$(uname -m)" in x86_64 | amd64) ARCH=64 ;; aarch64 | arm64) ARCH=arm64-v8a ;; *) echo "неподдерживаемая архитектура" >&2; exit 1 ;; esac
+    rm -rf "$NEWD"; mkdir -p "$NEWD"
+    URL="https://github.com/XTLS/Xray-core/releases/download/v$V/Xray-linux-$ARCH.zip"
+    curl -fsSL --retry 3 --max-time 300 -o "$NEWD/x.zip" "$URL" && curl -fsSL --retry 3 --max-time 60 -o "$NEWD/x.dgst" "$URL.dgst" || { echo "версия $V не скачана с GitHub" >&2; exit 1; }
+    want=$(sed -n 's/^SHA2-256= *//p' "$NEWD/x.dgst" | head -n1 | tr -d '[:space:]'); have=$(sha256sum "$NEWD/x.zip" | awk '{print $1}')
+    [ -n "$want" ] && [ "$want" = "$have" ] || { echo "контрольная сумма $V не совпала" >&2; exit 1; }
+    unzip -oq "$NEWD/x.zip" xray -d "$NEWD"; chmod 755 "$NEWD/xray"
+    "$NEWD/xray" run -test -c /usr/local/x-ui/bin/config.json >/dev/null 2>&1 || { echo "текущий конфиг Xray не проходит проверку версией $V" >&2; exit 1; }
+    if [ -x /usr/local/bin/chain-failclosed ]; then
+      rc=0; CHAIN_XRAY_BIN="$NEWD/xray" /usr/local/bin/chain-failclosed --quiet || rc=$?
+      [ "$rc" -eq 1 ] && { echo "на версии $V без моста трафик выходит с IP RELAY — обновление отменено" >&2; inc "обновление Xray" "версия $V отклонена: утечка без моста" "проверка chain-failclosed на новой версии вернула «выход есть»"; exit 1; }
+      [ "$rc" -eq 0 ] || echo "проверка «без моста нет выхода» на новой версии не выполнена (код $rc)" >&2
+    fi
+    echo "версия $V проверена и готова к установке" ;;
+  apply)
+    [ -x "$NEWD/xray" ] || { echo "сначала prepare" >&2; exit 1; }
+    cp -f "$BIN" "$BIN.prev"
+    install -m 755 "$NEWD/xray" "$BIN.new" && mv -f "$BIN.new" "$BIN"
+    systemctl restart x-ui
+    if wait_up; then echo "Xray на RELAY обновлён"; rm -rf "$NEWD"; exit 0; fi
+    mv -f "$BIN.prev" "$BIN"; systemctl restart x-ui; wait_up || true
+    inc "обновление Xray" "x-ui не поднялся на новой версии Xray" "автоматически возвращена прежняя версия"
+    echo "x-ui не поднялся на новой версии — возвращена прежняя" >&2; exit 1 ;;
+  rollback)
+    [ -x "$BIN.prev" ] || { echo "сохранённой версии нет ($BIN.prev)" >&2; exit 1; }
+    mv -f "$BIN.prev" "$BIN"; systemctl restart x-ui
+    if wait_up; then inc "обновление Xray" "Xray на RELAY возвращён на предыдущую версию" "по запросу"; echo "откат выполнен"; else echo "после отката x-ui не поднялся" >&2; exit 1; fi ;;
+  *) echo "неизвестная команда: $cmd" >&2; exit 1 ;;
+esac
+__CHAIN_EOF_XRAY_UPDATE_RELAY_SH__
+
+  cat > "$D/relay-harden.py" <<'__CHAIN_EOF_RELAY_HARDEN_PY__'
+#!/usr/bin/env python3
+# Отключает журнал доступа и DNS-журнал Xray в шаблоне 3x-ui, чтобы на RELAY не копились адреса назначения пользователей.
+# Меняет только log.access и log.dnsLog в шаблоне xrayTemplateConfig. Перед правкой делает копию базы. Код возврата: 0 — готово/менять нечего, 1 — ошибка.
+import json, os, shutil, sqlite3, sys, time
+
+DB = os.environ.get("CHAIN_XUI_DB", "/etc/x-ui/x-ui.db")
+if not os.path.exists(DB):
+    print("база 3x-ui не найдена: %s" % DB)
+    sys.exit(1)
+con = sqlite3.connect(DB, timeout=30)
+row = con.execute("select value from settings where key='xrayTemplateConfig'").fetchone()
+if not row or not row[0]:
+    print("шаблон Xray в базе не задан: менять нечего")
+    sys.exit(0)
+try:
+    tpl = json.loads(row[0])
+except Exception as e:
+    print("шаблон Xray не разобран: %s" % e)
+    sys.exit(1)
+log = tpl.setdefault("log", {})
+want = {"access": "none", "dnsLog": False}
+if str(log.get("loglevel", "")).lower() in ("debug", "info"):
+    want["loglevel"] = "warning"
+if all(log.get(k) == v for k, v in want.items()):
+    print("журналы Xray уже отключены")
+    sys.exit(0)
+shutil.copy2(DB, "%s.bak-%s" % (DB, time.strftime("%Y%m%d-%H%M%S")))
+log.update(want)
+con.execute("update settings set value=? where key='xrayTemplateConfig'", (json.dumps(tpl, ensure_ascii=False),))
+con.commit()
+print("журнал доступа и DNS-журнал Xray отключены (нужен перезапуск x-ui)")
+sys.exit(0)
+__CHAIN_EOF_RELAY_HARDEN_PY__
+
+  cat > "$D/failclosed.py" <<'__CHAIN_EOF_FAILCLOSED_PY__'
+#!/usr/bin/env python3
+# chain-failclosed — проверка: без моста RELAY не выпускает трафик пользователей в интернет сам.
+# Берёт настройки Xray из 3x-ui, поднимает их временную копию на свободных портах БЕЗ моста и проверяет три случая:
+#   1) контроль: маршрут пользователей временно заменён на прямой выход (должно работать — значит, проверка исправна);
+#   2) моста нет: маршрут как в работе (прямого выхода быть не должно);
+#   3) нет самого тега туннеля: Xray не находит исходящий и применяет исходящий по умолчанию (прямого выхода быть не должно).
+# Рабочая цепочка и пользователи не затрагиваются. Код возврата: 0 — выхода нет (хорошо), 1 — ВЫХОД ЕСТЬ (утечка IP RELAY), 2 — проверить не удалось.
+import copy, glob, json, os, signal, socket, subprocess, sys, tempfile, time
+
+CONF = os.environ.get("CHAIN_XRAY_CONFIG", "/usr/local/x-ui/bin/config.json")
+BIN = os.environ.get("CHAIN_XRAY_BIN") or next(iter(sorted(glob.glob("/usr/local/x-ui/bin/xray-linux-*"))), "")
+URL = os.environ.get("CHAIN_TEST_URL", "https://www.google.com/generate_204")
+USER_PORT, TUN_PORT = int(os.environ.get("CHAIN_USER_PORT", "21443")), int(os.environ.get("CHAIN_TUNNEL_PORT", "21444"))
+T_USER, T_TUN, T_SOCKS = 21463, 21464, 21485
+QUIET = "--quiet" in sys.argv
+
+
+def say(msg):
+    if not QUIET:
+        print(msg, flush=True)
+
+
+def listening(port, tries=40):
+    for _ in range(tries):
+        try:
+            socket.create_connection(("127.0.0.1", port), timeout=0.3).close()
+            return True
+        except OSError:
+            time.sleep(0.15)
+    return False
+
+
+def port_busy(port):
+    s = socket.socket()
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    try:
+        s.bind(("127.0.0.1", port))
+        return False
+    except OSError:
+        return True
+    finally:
+        s.close()
+
+
+def run_case(name, srv_cfg, cli_cfg, tmp):
+    sp, cp = os.path.join(tmp, name + "-s.json"), os.path.join(tmp, name + "-c.json")
+    json.dump(srv_cfg, open(sp, "w"))
+    json.dump(cli_cfg, open(cp, "w"))
+    t = subprocess.run([BIN, "run", "-test", "-c", sp], capture_output=True, text=True)
+    if t.returncode != 0:
+        say("  ✖ %s: Xray не принял тестовую конфигурацию: %s" % (name, (t.stdout + t.stderr).strip().splitlines()[-1:] or ""))
+        return None
+    procs = []
+    try:
+        procs.append(subprocess.Popen([BIN, "run", "-c", sp], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL))
+        if not listening(T_USER):
+            return None
+        procs.append(subprocess.Popen([BIN, "run", "-c", cp], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL))
+        if not listening(T_SOCKS):
+            return None
+        r = subprocess.run(["curl", "-s", "-o", "/dev/null", "-w", "%{http_code}", "--max-time", "12",
+                            "--socks5-hostname", "127.0.0.1:%d" % T_SOCKS, URL],
+                           capture_output=True, text=True)
+        return (r.stdout or "000").strip() or "000"
+    finally:
+        for p in procs:
+            p.send_signal(signal.SIGTERM)
+        for p in procs:
+            try:
+                p.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                p.kill()
+
+
+def main():
+    if not BIN or not os.access(BIN, os.X_OK):
+        say("Xray из 3x-ui не найден: проверка невозможна")
+        return 2
+    try:
+        cfg = json.load(open(CONF))
+    except Exception as e:
+        say("не удалось прочитать настройки Xray (%s): %s" % (CONF, e))
+        return 2
+    inb = {i.get("port"): i for i in cfg.get("inbounds", [])}
+    user_in, tun_in = inb.get(USER_PORT), inb.get(TUN_PORT)
+    if not user_in or not tun_in:
+        say("в настройках Xray нет инбаундов пользователей/туннеля (порты %d/%d)" % (USER_PORT, TUN_PORT))
+        return 2
+    for p in (T_USER, T_TUN, T_SOCKS):
+        if port_busy(p):
+            say("порт %d занят: проверка невозможна" % p)
+            return 2
+    try:
+        uid = user_in["settings"]["clients"][0]["id"]
+        xh = copy.deepcopy(user_in["streamSettings"]["xhttpSettings"])
+    except Exception:
+        say("не удалось прочитать клиента или xhttp-настройки инбаунда пользователей")
+        return 2
+    outs = cfg.get("outbounds", [])
+    direct = next((o.get("tag") for o in outs if o.get("protocol") == "freedom" and o.get("tag")), None)
+    if not direct:
+        say("в настройках Xray нет исходящего freedom: проверка невозможна")
+        return 2
+
+    def server(case):
+        u, t = copy.deepcopy(user_in), copy.deepcopy(tun_in)
+        u["port"], t["port"] = T_USER, T_TUN
+        u["listen"] = t["listen"] = "127.0.0.1"
+        rules = []
+        for r in copy.deepcopy(cfg.get("routing", {}).get("rules", [])):
+            if r.get("outboundTag") == "api" or "api" in (r.get("inboundTag") or []):
+                continue
+            if case == "control" and r.get("outboundTag") == "r-tunnel":
+                r["outboundTag"] = direct
+            rules.append(r)
+        if case == "notag":
+            for c in t.get("settings", {}).get("clients", []):
+                c.pop("reverse", None)
+        return {"log": {"loglevel": "none"}, "inbounds": [u, t], "outbounds": copy.deepcopy(outs),
+                "routing": {"domainStrategy": cfg.get("routing", {}).get("domainStrategy", "AsIs"), "rules": rules}}
+
+    client = {"log": {"loglevel": "none"},
+              "inbounds": [{"listen": "127.0.0.1", "port": T_SOCKS, "protocol": "socks", "settings": {"udp": False}}],
+              "outbounds": [{"protocol": "vless",
+                             "settings": {"address": "127.0.0.1", "port": T_USER, "id": uid, "encryption": "none"},
+                             "streamSettings": {"network": "xhttp", "security": "none", "xhttpSettings": xh}}]}
+    res = {}
+    with tempfile.TemporaryDirectory() as tmp:
+        for case in ("control", "nobridge", "notag"):
+            res[case] = run_case(case, server(case), client, tmp)
+    say("  контроль (прямой выход включён вручную): HTTP %s %s" % (res["control"], "— проверка исправна" if res["control"] == "204" else "— НЕ прошёл"))
+    say("  моста нет: HTTP %s %s" % (res["nobridge"], "— выхода нет" if res["nobridge"] == "000" else "— ЕСТЬ ВЫХОД"))
+    say("  тега туннеля нет: HTTP %s %s" % (res["notag"], "— выхода нет" if res["notag"] == "000" else "— ЕСТЬ ВЫХОД"))
+    if res["control"] != "204" or res["nobridge"] is None or res["notag"] is None:
+        say("ИТОГ: проверить не удалось (контроль не прошёл или тестовый Xray не поднялся)")
+        return 2
+    if res["nobridge"] != "000" or res["notag"] != "000":
+        say("ИТОГ: УТЕЧКА — без моста трафик пользователей выходит в интернет с IP RELAY")
+        return 1
+    say("ИТОГ: без моста RELAY трафик пользователей в интернет не выпускает")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+__CHAIN_EOF_FAILCLOSED_PY__
+
+  cat > "$D/detect-check.py" <<'__CHAIN_EOF_DETECT_CHECK_PY__'
+#!/usr/bin/env python3
+# Проверка сервера на детекты: на каком этапе обрывается связь — DNS, IP/TCP, TLS/SNI, объём данных, HTTP — и состояние цепочки на этом сервере.
+# Запускается на том сервере, где открыт скрипт (RELAY или BACKEND), ничего не меняет в системе. Нужны только python3 и curl.
+# Приёмы: один и тот же IP проверяется с разными именами (SNI), одно и то же имя — с разными IP; закачка 64 КБ и скачивание 20 МБ ищут обрыв по объёму.
+# Код возврата: 0 — проблем не найдено, 1 — найдены.
+import concurrent.futures as cfu, glob, os, random, re, socket, ssl, struct, subprocess, sys, tempfile, time
+
+T = float(os.environ.get("CHECK_TIMEOUT", "6"))
+SKIP_FC = "--skip-failclosed" in sys.argv
+DOMAINS = os.environ.get("CHECK_DOMAINS", "www.youtube.com www.instagram.com www.facebook.com x.com discord.com telegram.org www.linkedin.com www.whatsapp.com").split()
+CONTROL = os.environ.get("CHECK_CONTROL", "www.cloudflare.com www.wikipedia.org www.google.com").split()
+RESOLVERS = [("1.1.1.1", "Cloudflare"), ("8.8.8.8", "Google"), ("77.88.8.8", "Яндекс")]
+FOREIGN_TCP = [("1.1.1.1", 443), ("9.9.9.9", 443), ("8.8.8.8", 443), ("104.16.132.229", 443)]
+DOMESTIC_HOSTS = ["ya.ru", "vk.com"]
+TTY = sys.stdout.isatty()
+C = {"ok": "\033[32m", "warn": "\033[33m", "bad": "\033[31m", "dim": "\033[2m", "end": "\033[0m"} if TTY else {k: "" for k in ("ok", "warn", "bad", "dim", "end")}
+problems, warnings = [], []
+
+
+def line(kind, text):
+    sym = {"ok": "✔", "warn": "▲", "bad": "✖", "dim": "·"}[kind]
+    print("  %s%s%s %s" % (C[kind], sym, C["end"], text), flush=True)
+    if kind == "bad":
+        problems.append(text)
+    elif kind == "warn":
+        warnings.append(text)
+
+
+def head(n, title):
+    print("\n%s%d. %s%s" % (C["ok"] if False else "", n, title, ""), flush=True)
+
+
+def resolve_sys(host):
+    try:
+        return sorted({a[4][0] for a in socket.getaddrinfo(host, 443, socket.AF_INET, socket.SOCK_STREAM)})
+    except OSError:
+        return []
+
+
+def dns_query(server, host, timeout=3.0):
+    qid = random.randrange(65536)
+    q = struct.pack(">HHHHHH", qid, 0x0100, 1, 0, 0, 0) + b"".join(bytes([len(p)]) + p.encode() for p in host.split(".")) + b"\0" + struct.pack(">HH", 1, 1)
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    s.settimeout(timeout)
+    try:
+        s.sendto(q, (server, 53))
+        data, _ = s.recvfrom(4096)
+        if len(data) < 12 or struct.unpack(">H", data[:2])[0] != qid:
+            return None
+        an, pos, ips = struct.unpack(">H", data[6:8])[0], 12, []
+        while data[pos] != 0:
+            pos += data[pos] + 1
+        pos += 5
+        for _ in range(an):
+            if data[pos] & 0xC0 == 0xC0:
+                pos += 2
+            else:
+                while data[pos] != 0:
+                    pos += data[pos] + 1
+                pos += 1
+            typ, _c, _t, rdl = struct.unpack(">HHIH", data[pos:pos + 10])
+            pos += 10
+            if typ == 1 and rdl == 4:
+                ips.append(socket.inet_ntoa(data[pos:pos + 4]))
+            pos += rdl
+        return ips
+    except Exception:
+        return None
+    finally:
+        s.close()
+
+
+def tcp(ip, port, timeout=T):
+    t0 = time.time()
+    try:
+        socket.create_connection((ip, port), timeout=timeout).close()
+        return True, int((time.time() - t0) * 1000), ""
+    except socket.timeout:
+        return False, 0, "таймаут"
+    except ConnectionRefusedError:
+        return False, 0, "отказ (RST)"
+    except OSError as e:
+        return False, 0, str(e.strerror or e)[:40]
+
+
+def tls(ip, sni, port=443, timeout=T):
+    """Возвращает (статус, мс): ok — рукопожатие завершено, alert — сервер ответил ошибкой TLS (это тоже ответ),
+    tcp-* — TCP не открылся, hello-timeout — соединились, а на ClientHello тишина, reset/closed — оборвали после ClientHello."""
+    t0 = time.time()
+    try:
+        s = socket.create_connection((ip, port), timeout=timeout)
+    except socket.timeout:
+        return "tcp-timeout", 0
+    except ConnectionRefusedError:
+        return "tcp-refused", 0
+    except OSError:
+        return "tcp-error", 0
+    try:
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+        s.settimeout(timeout)
+        w = ctx.wrap_socket(s, server_hostname=sni)
+        w.close()
+        return "ok", int((time.time() - t0) * 1000)
+    except socket.timeout:
+        return "hello-timeout", 0
+    except ConnectionResetError:
+        return "reset", 0
+    except (ssl.SSLEOFError, ssl.SSLZeroReturnError):
+        return "closed", 0
+    except ssl.SSLError:
+        return "alert", int((time.time() - t0) * 1000)
+    except OSError:
+        return "closed", 0
+    finally:
+        try:
+            s.close()
+        except OSError:
+            pass
+
+
+def reach(st):
+    return st in ("ok", "alert")
+
+
+def curl(args, timeout=25):
+    r = subprocess.run(["curl", "-sS", "-o", "/dev/null", "--max-time", str(timeout), "-w", "%{http_code} %{size_download} %{size_upload} %{time_total} %{speed_download} %{http_version}"] + args,
+                       capture_output=True, text=True)
+    f = (r.stdout.strip().split() + ["0", "0", "0", "0", "0", "0"])[:6]
+    return r.returncode, f[0], int(float(f[1])), int(float(f[2])), float(f[3]), float(f[4]), f[5], r.stderr.strip()
+
+
+# ---------- 1. DNS ----------
+def stage_dns():
+    head(1, "DNS")
+    hosts = DOMAINS[:3] + CONTROL[:1]
+    bad_sys, ext_alive, alt = 0, 0, {}
+    for h in hosts:
+        sysips = resolve_sys(h)
+        ext = {n: dns_query(ip, h) for ip, n in RESOLVERS}
+        if any(v for v in ext.values()):
+            ext_alive += 1
+        alt[h] = sorted({i for v in ext.values() if v for i in v} - set(sysips))
+        bogus = [i for i in sysips if i.startswith(("0.", "127.", "10.", "192.168.")) or i == "255.255.255.255"]
+        if not sysips:
+            bad_sys += 1
+            line("bad", "%s: системный резолвер не отдал адрес" % h)
+        elif bogus:
+            bad_sys += 1
+            line("bad", "%s: системный резолвер отдал служебный адрес %s (подмена ответа)" % (h, ", ".join(bogus)))
+        else:
+            e = ", ".join("%s %s" % (n, "нет ответа" if v is None else ("%d адр." % len(v))) for n, v in ext.items())
+            line("ok", "%s: %d адр. от системного резолвера; внешние: %s" % (h, len(sysips), e))
+    if ext_alive == 0:
+        line("warn", "внешние резолверы (1.1.1.1, 8.8.8.8, 77.88.8.8) по UDP/53 не отвечают — это не ошибка, но сравнить ответы нельзя")
+    return alt
+
+
+# ---------- 2. IP / TCP ----------
+def stage_tcp():
+    head(2, "IP / TCP (соединение без TLS)")
+    with cfu.ThreadPoolExecutor(8) as ex:
+        res = list(ex.map(lambda t: (t, tcp(*t)), FOREIGN_TCP))
+    ok = [r for r in res if r[1][0]]
+    ms = sorted(r[1][1] for r in ok)
+    if not ok:
+        line("bad", "ни один из %d внешних адресов не открывает TCP :443 (%s)" % (len(res), res[0][1][2]))
+    elif len(ok) < len(res):
+        line("warn", "TCP :443 открывается у %d из %d внешних адресов (%s)" % (len(ok), len(res), ", ".join("%s: %s" % (r[0][0], r[1][2]) for r in res if not r[1][0])))
+    else:
+        line("ok", "внешние адреса: %d из %d открываются, медиана %d мс" % (len(ok), len(res), ms[len(ms) // 2]))
+    dom = []
+    for h in DOMESTIC_HOSTS:
+        ips = resolve_sys(h)
+        if ips:
+            dom.append((h, tcp(ips[0], 443)))
+    if dom:
+        okd = [d for d in dom if d[1][0]]
+        line("ok" if len(okd) == len(dom) else "warn", "российские адреса: %d из %d открываются (%s)" % (len(okd), len(dom), ", ".join("%s %s" % (d[0], ("%d мс" % d[1][1]) if d[1][0] else d[1][2]) for d in dom)))
+
+
+# ---------- 3. TLS / SNI ----------
+def stage_sni(alt):
+    head(3, "TLS / SNI (одно имя на разных адресах, один адрес с разными именами)")
+    ctl_ips = resolve_sys(CONTROL[0])
+    if not ctl_ips:
+        line("warn", "контрольный адрес (%s) не определён — этап пропущен" % CONTROL[0])
+        return
+    ctl = ctl_ips[0]
+    st, _ = tls(ctl, CONTROL[0])
+    if not reach(st):
+        line("bad", "контрольное имя %s на своём адресе не проходит (%s): дальше сравнивать нечего — проверьте связь (этапы 1–2)" % (CONTROL[0], st))
+        return
+
+    def one(d):
+        ips = resolve_sys(d)
+        if not ips:
+            return d, "bad", "системный DNS не отдал адрес"
+        ip = ips[0]
+        a, ms = tls(ip, d)
+        if reach(a):
+            return d, "ok", "рукопожатие за %d мс" % ms
+        if a.startswith("tcp-"):
+            return d, "bad", "TCP до %s не открывается (%s): блок по IP/подсети или сервис недоступен" % (ip, a)
+        b, _ = tls(ip, "example.com")
+        c, _ = tls(ctl, d)
+        ext = [i for i in alt.get(d, []) if i != ip][:1]
+        e = tls(ext[0], d)[0] if ext else None
+        if e and reach(e):
+            return d, "bad", "с адресом %s от внешнего резолвера открывается, с %s из системного DNS — нет: подмена или недоступный адрес в ответе DNS" % (ext[0], ip)
+        if reach(b) and not reach(c):
+            return d, "bad", "блок по SNI: ClientHello с этим именем отбрасывается (%s), на том же адресе нейтральное имя проходит" % a
+        if not reach(b):
+            return d, "bad", "блок по IP/подсети: любой TLS на %s не проходит (%s)" % (ip, a)
+        return d, "warn", "нестабильно: на своём адресе (%s) не проходит, нейтральное имя и чужой адрес проходят" % a
+
+    with cfu.ThreadPoolExecutor(8) as ex:
+        results = list(ex.map(one, DOMAINS))
+    for d, kind, msg in results:
+        line(kind, "%s: %s" % (d, msg))
+    sni = [d for d, k, m in results if k == "bad" and "блок по SNI" in m]
+    if sni:
+        print("  %sВывод:%s у этого сервера отбрасываются ClientHello с именами: %s" % (C["dim"], C["end"], ", ".join(sni)))
+
+
+# ---------- 4. Объём ----------
+def stage_volume():
+    head(4, "Объём данных (обрыв после первых килобайт) и скорость")
+    with tempfile.NamedTemporaryFile(delete=False) as f:
+        f.write(os.urandom(65536))
+        path = f.name
+    try:
+        rc, code, _, up, t, _, _, err = curl(["-X", "POST", "--data-binary", "@" + path, "https://speed.cloudflare.com/__up"], 20)
+    finally:
+        os.unlink(path)
+    if rc == 0 and code != "000":
+        line("ok", "закачка 64 КБ: ответ получен (HTTP %s) за %.1f с" % (code, t))
+    else:
+        line("bad", "закачка 64 КБ не завершилась (curl %d, отправлено %d байт): %s" % (rc, up, "возможен обрыв по объёму" if 10000 <= up <= 30000 else err[:80]))
+    for name, url, extra in (("скачивание 20 МБ (Cloudflare)", "https://speed.cloudflare.com/__down?bytes=20000000", []),
+                             ("скачивание 20 МБ (Google)", "https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb", ["-r", "0-19999999"])):
+        rc, code, size, _, t, sp, _, err = curl(extra + [url], 25)
+        if rc == 0 and size >= 19000000:
+            line("ok", "%s: %.1f МБ/с (%.0f Мбит/с)" % (name, sp / 1e6, sp * 8 / 1e6))
+        elif 10000 <= size <= 30000:
+            line("bad", "%s: передача оборвалась на %d байтах — признак обрыва по объёму (около 16 КБ)" % (name, size))
+        elif size > 0:
+            line("warn", "%s: получено %.1f МБ из 20, curl %d — медленно или оборвалось" % (name, size / 1e6, rc))
+        else:
+            line("bad", "%s: данные не получены (curl %d, HTTP %s) %s" % (name, rc, code, err[:60]))
+
+
+# ---------- 5. HTTP ----------
+def stage_http():
+    head(5, "HTTP (порт 80 и HTTPS/2)")
+    r = subprocess.run(["curl", "-sS", "--max-time", str(int(T) + 4), "http://example.com/"], capture_output=True, text=True)
+    if r.returncode != 0:
+        line("warn", "http://example.com: нет ответа (curl %d)" % r.returncode)
+    elif "Example Domain" in r.stdout:
+        line("ok", "порт 80: ответ настоящий")
+    else:
+        line("bad", "порт 80: ответ подменён (в теле нет «Example Domain»)")
+    rc, code, _, _, t, _, ver, err = curl(["https://www.cloudflare.com/cdn-cgi/trace"], int(T) + 4)
+    if rc == 0 and code == "200":
+        line("ok", "HTTPS: HTTP/%s за %.2f с" % (ver, t))
+    else:
+        line("bad", "HTTPS www.cloudflare.com: не получилось (curl %d, HTTP %s) %s" % (rc, code, err[:60]))
+
+
+# ---------- 6. Цепочка на этом сервере ----------
+def sh(cmd, timeout=20):
+    try:
+        r = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=timeout)
+        return r.returncode, r.stdout.strip()
+    except subprocess.TimeoutExpired:
+        return 124, ""
+
+
+def stage_chain():
+    mark = "/root/.chain-setup.installed"
+    if not os.path.exists(mark):
+        return
+    role = (re.search(r"^ROLE=(\S+)", open(mark).read(), re.M) or [None, "relay"])[1]
+    head(6, "Цепочка на этом сервере (%s)" % role.upper())
+    if role == "backend":
+        rc, _ = sh("systemctl is-active --quiet chain-bridge")
+        line("ok" if rc == 0 else "bad", "служба chain-bridge: %s" % ("работает" if rc == 0 else "не работает"))
+        relay = (re.search(r"^RELAY_IP=(\S+)", open("/etc/chain-bridge/sync.conf").read(), re.M) or [None, ""])[1] if os.path.exists("/etc/chain-bridge/sync.conf") else ""
+        if relay:
+            rc, out = sh('ss -tnH state established "( dst %s and dport = :443 )" | wc -l' % relay)
+            n = int(out or 0)
+            line("ok" if n else "bad", "соединений моста с RELAY: %d" % n)
+            st, ms = tls(relay, "www.example.com")
+            line("ok" if reach(st) else "bad", "TLS до RELAY:443 с этого сервера (направление за рубежа → РФ): %s" % ("%d мс" % ms if reach(st) else st))
+        rc, out = sh("/usr/local/bin/chain-update-bridge --status")
+        if out:
+            print("    " + out.replace("\n", "\n    "))
+    else:
+        conf = open("/root/.chain-setup.conf").read() if os.path.exists("/root/.chain-setup.conf") else ""
+        dom = (re.search(r"^DOMAIN=(\S+)", conf, re.M) or [None, ""])[1]
+        for s in ("nginx", "x-ui"):
+            rc, _ = sh("systemctl is-active --quiet %s" % s)
+            line("ok" if rc == 0 else "bad", "служба %s: %s" % (s, "работает" if rc == 0 else "не работает"))
+        if dom:
+            rc, out = sh("curl -sS -o /dev/null --max-time 8 --resolve %s:443:127.0.0.1 -w '%%{http_code} %%{http_version}' https://%s/" % (dom, dom))
+            line("ok" if out.startswith("200") else "bad", "сайт-приманка %s: HTTP %s" % (dom, out or "нет ответа"))
+            rc, out = sh("curl -sS -o /dev/null --max-time 8 --resolve %s:443:127.0.0.1 -w '%%{http_code}' https://%s/zz-%d/" % (dom, dom, random.randrange(10 ** 6)))
+            line("ok" if out == "404" else "warn", "несуществующий путь отвечает HTTP %s (ожидается 404)" % (out or "нет ответа"))
+        rc, out = sh("/usr/local/bin/chain-certcheck --days")
+        if out.lstrip("-").isdigit():
+            d = int(out)
+            line("ok" if d >= 21 else "bad", "сертификат: осталось %d дн." % d)
+        rc, out = sh('ss -tnH state established "( sport = :21444 )" | wc -l')
+        n = int(out or 0)
+        line("ok" if n else "bad", "соединений моста: %d" % n)
+        if os.path.exists("/usr/local/bin/chain-failclosed") and not SKIP_FC:
+            print("    проверка «без моста нет выхода» (около минуты)…", flush=True)
+            rc, out = sh("/usr/local/bin/chain-failclosed", 150)
+            line({0: "ok", 1: "bad"}.get(rc, "warn"), out.splitlines()[-1] if out else "проверка не выполнена")
+    rc, out = sh("tail -n 3 /var/log/chain-incidents.log 2>/dev/null")
+    if out:
+        print("    последние записи журнала сбоев:\n      " + out.replace("\n", "\n      "))
+
+
+def main():
+    print("Проверка сервера на детекты — %s" % time.strftime("%F %T"))
+    alt = stage_dns()
+    stage_tcp()
+    stage_sni(alt)
+    stage_volume()
+    stage_http()
+    stage_chain()
+    print("\nИТОГ: проблем %d, замечаний %d" % (len(problems), len(warnings)))
+    if problems:
+        print("Найдено:")
+        for p in problems:
+            print("  - " + p)
+        if os.path.exists("/usr/local/bin/chain-incident"):
+            subprocess.run(["/usr/local/bin/chain-incident", "проверка на детекты", "найдено проблем: %d" % len(problems), "; ".join(problems)[:280]], capture_output=True)
+    return 1 if problems else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+__CHAIN_EOF_DETECT_CHECK_PY__
 
   # BACKEND: firewall — только SSH (все остальные входящие закрыты)
   cat > "$D/ufw-backend.sh" <<'EOF'
@@ -4192,6 +5098,10 @@ rm -rf /etc/chain-bridge
 userdel chainbridge >/dev/null 2>&1 || true
 rm -f /etc/sysctl.d/99-relay-network-tuning.conf /etc/modules-load.d/relay-bbr.conf
 systemctl daemon-reload
+rm -f /usr/local/bin/chain-restart-bridge /usr/local/bin/chain-incident /etc/logrotate.d/chain-incidents /etc/systemd/journald.conf.d/chain-limits.conf
+rm -rf /var/lib/chain-incident
+rm -f /var/log/chain-incidents.log /var/log/chain-incidents.log.*
+[ -f /root/.ssh/authorized_keys ] && sed -i '/ chain-restart@/d' /root/.ssh/authorized_keys
 sysctl --system >/dev/null 2>&1 || true
 exit 0
 EOF
@@ -4223,12 +5133,12 @@ relay_firewall() {
 # 3x-ui на RELAY: GitHub из РФ бывает недоступен — тогда качаем через BACKEND (SOCKS поверх SSH)
 xui_stage() {
   local proxy="" res rc=0
-  if ! curl -fsS --max-time 12 -o /dev/null -I https://raw.githubusercontent.com/mhsanaei/3x-ui/master/install.sh >>"$LOG" 2>&1; then
+  if ! curl -fsS --max-time 12 -o /dev/null -I "https://raw.githubusercontent.com/mhsanaei/3x-ui/$XUI_VER/install.sh" >>"$LOG" 2>&1; then
     warn "GitHub с RELAY недоступен напрямую: 3x-ui загрузится через BACKEND (SOCKS поверх SSH)"
     if ssh "${SSH_OPTS[@]}" -O forward -D 127.0.0.1:1080 "root@$BACKEND_IP" >>"$LOG" 2>&1; then proxy="socks5h://127.0.0.1:1080"; fi
   fi
-  step_run "3x-ui: загрузка установщика" env ALL_PROXY="$proxy" bash "$TMPD/xui-fetch.sh" || rc=1
-  [ $rc -eq 0 ] && { step_run "3x-ui: установка (SQLite, порт $PANEL_PORT)" env ALL_PROXY="$proxy" bash "$TMPD/xui-install.sh" "$PANEL_PORT" || rc=1; }
+  step_run "3x-ui $XUI_VER: загрузка установщика" env ALL_PROXY="$proxy" bash "$TMPD/xui-fetch.sh" "$XUI_VER" || rc=1
+  [ $rc -eq 0 ] && { step_run "3x-ui: установка (SQLite, порт $PANEL_PORT)" env ALL_PROXY="$proxy" bash "$TMPD/xui-install.sh" "$PANEL_PORT" "$XUI_VER" || rc=1; }
   [ $rc -eq 0 ] && { step_run "3x-ui: запуск, панель на 127.0.0.1:$PANEL_PORT" bash "$TMPD/xui-check.sh" "$PANEL_PORT" || rc=1; }
   [ -n "$proxy" ] && { ssh "${SSH_OPTS[@]}" -O cancel -D 127.0.0.1:1080 "root@$BACKEND_IP" >>"$LOG" 2>&1 || true; }
   [ $rc -eq 0 ] || die "3x-ui не установился"
@@ -4279,7 +5189,46 @@ chain_load() {  # читает результат chain_inbounds в переме
 
 # мост BACKEND: установка и запуск
 backend_bridge() {
-  rscript "$TMPD/bridge-install.sh" "$RELAY_IP" "$DOMAIN" "$TUNNEL_PATH" "$TUNNEL_UUID" "$VER_PATH" "${TUNNEL_OBFS:-0}"
+  rscript "$TMPD/bridge-install.sh" "$RELAY_IP" "$DOMAIN" "$TUNNEL_PATH" "$TUNNEL_UUID" "$VER_PATH" "${TUNNEL_OBFS:-0}" "$XRAY_VER" &&
+    rscript "$TMPD/bridge-tools.sh"
+}
+
+# журнал сбоев (/var/log/chain-incidents.log) на RELAY и BACKEND
+install_incident_log() {
+  lscript "$TMPD/incident-install.sh" && rscript "$TMPD/incident-install.sh"
+}
+
+# SSH-ключ RELAY → BACKEND, который на BACKEND разрешает единственную команду — перезапуск моста (и ping для проверки ключа)
+setup_restart_key() {
+  local k=/root/.ssh/chain-restart b64
+  if [ "${LOCAL_BACKEND:-0}" = 1 ]; then echo "BACKEND на этом же сервере: ключ не нужен"; return 0; fi
+  mkdir -p /root/.ssh && chmod 700 /root/.ssh
+  [ -f "$k" ] || ssh-keygen -q -t ed25519 -N "" -C "chain-restart@$(hostname -s)" -f "$k" || return 1
+  b64=$(base64 -w0 < "$k.pub") || return 1
+  rscript "$TMPD/restart-key-install.sh" "$b64" || return 1
+  ssh -i "$k" -p "$BACKEND_PORT" -o BatchMode=yes -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -o ConnectTimeout=10 \
+    "root@$BACKEND_IP" ping 2>>"$LOG" | grep -q "ключ работает"
+}
+
+# GitHub с RELAY из РФ бывает недоступен: тогда качаем через BACKEND (SOCKS поверх SSH); печатает адрес прокси (пусто — напрямую)
+github_proxy_open() {
+  local p=""
+  if ! curl -fsS --max-time 12 -o /dev/null -I https://github.com >>"$LOG" 2>&1; then
+    if [ "${LOCAL_BACKEND:-0}" != 1 ] && ssh "${SSH_OPTS[@]}" -O forward -D 127.0.0.1:1080 "root@$BACKEND_IP" >>"$LOG" 2>&1; then p="socks5h://127.0.0.1:1080"; fi
+  fi
+  printf '%s' "$p"
+}
+github_proxy_close() { [ -n "${1:-}" ] && { ssh "${SSH_OPTS[@]}" -O cancel -D 127.0.0.1:1080 "root@$BACKEND_IP" >>"$LOG" 2>&1 || true; }; return 0; }
+
+# идентификатор первого клиента инбаунда пользователей (нужен сквозной проверке при обновлении)
+load_user_id() {
+  CHAIN_USER_ID=$(python3 - 2>>"$LOG" <<'PY'
+import json, sqlite3
+db = sqlite3.connect("/etc/x-ui/x-ui.db")
+print(json.loads(db.execute("select settings from inbounds where port = 21443 limit 1").fetchone()[0])["clients"][0]["id"])
+PY
+) || true
+  [ -n "$CHAIN_USER_ID" ]
 }
 
 # число соединений моста, пришедших на инбаунд туннеля
@@ -4440,11 +5389,12 @@ run_install() {
   esac
   rscript "$TMPD/f2b-ignore.sh" "$RELAY_IP" >>"$LOG" 2>&1 || true
   write_marker_backend in-progress
+  step_run "Журнал сбоев (/var/log/chain-incidents.log) на RELAY и BACKEND" install_incident_log || warn "журнал сбоев установлен не полностью"
 
   # [3] сеть
   section "Сетевая оптимизация (RELAY и BACKEND)"
-  step_run "RELAY: BBR, буферы TCP/UDP, MTU probing, keepalive" tune_network || warn "твики на RELAY применены не полностью"
-  step_run "BACKEND: BBR, буферы TCP/UDP, MTU probing, keepalive" rscript "$TMPD/tune.sh" || warn "твики на BACKEND применены не полностью"
+  step_run "RELAY: BBR, буферы TCP, MTU probing, keepalive, MPTCP выключен, лимиты журнала" tune_network || warn "твики на RELAY применены не полностью"
+  step_run "BACKEND: BBR, буферы TCP, MTU probing, keepalive, MPTCP выключен, лимиты журнала" rscript "$TMPD/tune.sh" || warn "твики на BACKEND применены не полностью"
 
   # [4] пакеты и firewall RELAY
   section "RELAY: пакеты и firewall"
@@ -4495,13 +5445,16 @@ run_install() {
   save_conf
   step_run "nginx: сертификат, секретные пути, «живые» эндпоинты, автопродление (панель: $([ $HIDE_PANEL -eq 1 ] && echo скрыта || echo опубликована))" python3 "$TMPD/nginx-final.py" "$DOMAIN" "$xw" "$USER_PATH" "$TUNNEL_PATH" "$CHAIN_USER_PORT" "$CHAIN_TUNNEL_PORT" "$BACKEND_IP" "$HIDE_PANEL" "$VER_PATH" || die "не удалось включить финальный конфиг nginx"
   /usr/local/bin/sync-sub-path >>"$LOG" 2>&1 || true
+  step_run "3x-ui: журнал доступа и DNS-журнал Xray отключены" python3 "$TMPD/relay-harden.py" || warn "журналы Xray не отключены (см. лог)"
   step_run "Перезапуск 3x-ui (применение маршрутизации)" bash -c 'systemctl restart x-ui && sleep 4 && systemctl is-active --quiet x-ui' || warn "x-ui не перезапустился"
-  step_run "chain-health (состояние туннеля для сторожа) и путь /health в nginx" lscript "$TMPD/health-relay.sh" "$VER_PATH" || warn "chain-health установлен не полностью (см. лог)"
+  step_run "chain-health, автотест после перезагрузки, проверка сертификата, счётчик соединений" lscript "$TMPD/health-relay.sh" "$VER_PATH" || warn "chain-health установлен не полностью (см. лог)"
+  install -m 755 "$TMPD/failclosed.py" /usr/local/bin/chain-failclosed
 
   # [10] мост на BACKEND
   section "BACKEND: мост Xray"
-  step_run "Установка Xray (проверка SHA-256) и запуск chain-bridge" backend_bridge || die "мост не запустился (journalctl -u chain-bridge на BACKEND)"
-  step_run "Сторож моста (chain-watchdog, раз в минуту) и keepalive HTTP/2" rscript "$TMPD/watchdog-install.sh" || warn "сторож моста установлен не полностью (см. лог)"
+  step_run "Установка Xray $XRAY_VER (проверка SHA-256), запуск chain-bridge, инструменты обновления" backend_bridge || die "мост не запустился (journalctl -u chain-bridge на BACKEND)"
+  step_run "Сторож моста (локальный, в сеть ничего не отправляет), keepalive HTTP/2, защита моста" rscript "$TMPD/watchdog-install.sh" || warn "сторож моста установлен не полностью (см. лог)"
+  step_run "SSH-ключ RELAY для перезапуска моста (разрешена только эта команда)" setup_restart_key || warn "ключ для перезапуска моста не настроен (см. лог): RELAY не сможет сам перезапустить мост"
 
   # [11] проверка цепочки
   section "Проверка цепочки"
@@ -4525,6 +5478,17 @@ run_install() {
     CHECK_FAIL=1
   else
     warn "выходной IP цепочки отличается от внешнего IP BACKEND (общий NAT или несколько адресов); если у клиента интернет работает, это не ошибка"
+  fi
+
+  if [ -x /usr/local/bin/chain-failclosed ]; then
+    local fcr=0 fcout
+    fcout=$(/usr/local/bin/chain-failclosed 2>>"$LOG") || fcr=$?
+    [ -n "$fcout" ] && printf '%s\n' "$fcout" >>"$LOG"
+    case $fcr in
+      0) ok "без моста RELAY трафик пользователей в интернет не выпускает (проверено на копии настроек)" ;;
+      1) fail "УТЕЧКА: без моста трафик пользователей выходит в интернет с IP RELAY (подробности: chain-failclosed)"; CHECK_FAIL=1 ;;
+      *) warn "проверка «без моста нет выхода» не выполнена (запустите chain-failclosed вручную)" ;;
+    esac
   fi
 
   # [12] firewall BACKEND и итог
@@ -4594,11 +5558,15 @@ run_install() {
   echo "     chain-site-refresh           обновить страницы «живого» сайта (то же делает таймер раз в 5 минут)"
   echo "     sync-sub-path                прописать пути подписки из 3x-ui в nginx (таймер; вручную — после смены путей в панели)"
   echo "     chain-xray-version           записать версию Xray релея (срабатывает сама при обновлении ядра панели)"
-  echo "     chain-health --show          состояние туннеля, которое видит сторож BACKEND (обновляется раз в 30 с)"
+  echo "     chain-health --show          состояние цепочки: мост, сквозная проверка, нагрузка, последние сбои (обновляется раз в 30 с)"
+  echo "     chain-incident --show [N]    журнал сбоев /var/log/chain-incidents.log: что упало и почему"
+  echo "     chain-failclosed             проверка: без моста RELAY не выпускает трафик пользователей в интернет"
+  echo "     chain-certcheck              срок сертификата и пробное продление (то же делает таймер раз в неделю)"
   echo "   BACKEND:"
-  echo "     chain-set-relay IP           указать новый IP RELAY и перезапустить мост"
-  echo "     chain-update-bridge [ВЕРСИЯ|--status]   привести Xray моста к версии RELAY или к указанной; --status — показать версии (только вручную)"
-  echo "     chain-watchdog --status      решение сторожа и история перезапусков моста (сторож проверяет раз в минуту)"
+  echo "     chain-set-relay IP           указать новый IP RELAY (если мост не подключится за 40 с, прежний адрес вернётся)"
+  echo "     chain-update-bridge [ВЕРСИЯ|--rollback|--status]   Xray моста: к версии RELAY или к указанной (прежняя сохраняется, при неудаче откат), --rollback — вернуть прежнюю"
+  echo "     chain-watchdog --status      состояние сторожа и перезапуски моста (локальные проверки раз в минуту)"
+  echo "     chain-incident --show [N]    журнал сбоев /var/log/chain-incidents.log"
   echo "     systemctl status chain-bridge, journalctl -u chain-bridge   состояние и журнал моста"
   echo
   echo "  ${B}Открыть панель (выполните на СВОЁМ компьютере):${R}"
@@ -4617,11 +5585,13 @@ run_install() {
 }
 
 # ───────────────────────── обновление без переустановки ─────────────────────────
-# Ставит сторож моста (BACKEND) и chain-health (RELAY), добавляет keepalive мосту и чинит путь версии Xray в nginx.
-# Пользователи, пути клиентов, подписка и сертификат не меняются; мост перезапускается один раз.
+# RELAY: журнал сбоев, chain-health (счётчик соединений, перезапуск моста по ограниченному SSH-ключу), автотест после перезагрузки,
+# проверка сертификата, проверка «без моста нет выхода», отключение журнала доступа Xray.
+# BACKEND: локальный сторож (в сеть ничего не отправляет), защита моста, chain-update-bridge с откатом.
+# Пользователи, пути клиентов, подписка и сертификат не меняются; мост перезапускается один раз, 3x-ui — один раз.
 run_upgrade() {
   INSTALL_KIND="chain"
-  STEP=0; TOTAL=3
+  STEP=0; TOTAL=4
   if [ "$(marker_get ROLE)" = backend ]; then
     fail "этот сервер — BACKEND: обновление запускают на RELAY"
     return 1
@@ -4631,20 +5601,30 @@ run_upgrade() {
     return 1
   fi
   echo
-  echo "${B}Обновление до v$VERSION: сторож моста и keepalive${R}"
+  echo "${B}Обновление до v$VERSION${R}"
   thin
-  info "RELAY: chain-health (состояние туннеля раз в 30 с) и путь /health в nginx; заодно исправляется путь версии Xray"
-  info "BACKEND: keepalive HTTP/2 для моста и chain-watchdog (проверка раз в минуту); мост перезапустится один раз, потоки оборвутся на несколько секунд"
+  info "RELAY: журнал сбоев; chain-health с перезапуском моста по ограниченному SSH-ключу; автотест после перезагрузки; проверка сертификата раз в неделю; проверка «без моста нет выхода»; журнал доступа Xray отключается"
+  info "BACKEND: локальный сторож (в сеть ничего не отправляет); защита моста от обращений к самому серверу; chain-update-bridge с откатом; chain-set-relay с проверкой"
+  info "обе стороны: MPTCP выключается, лимиты журнала systemd; 3x-ui и мост перезапустятся по одному разу (потоки оборвутся на несколько секунд)"
   info "пользователи, пути клиентов, подписка и сертификат не меняются"
   confirm "Продолжить?" || { echo "  Отменено."; return 0; }
   section "Подключение к BACKEND"
   ask_backend
   [ "${LOCAL_BACKEND:-0}" = 1 ] || ssh_connect
   make_scripts
-  section "RELAY: состояние туннеля для сторожа"
-  step_run "chain-health (таймер 30 с) и путь /health в nginx" lscript "$TMPD/health-relay.sh" "$VER_PATH" || die "RELAY не обновлён (см. лог)"
-  section "BACKEND: keepalive и сторож моста"
-  step_run "keepalive HTTP/2 для моста, chain-watchdog (таймер 1 мин), перезапуск моста" rscript "$TMPD/watchdog-install.sh" || die "BACKEND не обновлён (см. лог)"
+  section "Журнал сбоев и сетевые настройки"
+  step_run "Журнал сбоев на RELAY и BACKEND" install_incident_log || die "журнал сбоев не установлен (см. лог)"
+  step_run "RELAY: BBR, буферы TCP, MPTCP выключен, лимиты журнала" tune_network || warn "твики на RELAY применены не полностью"
+  step_run "BACKEND: BBR, буферы TCP, MPTCP выключен, лимиты журнала" rscript "$TMPD/tune.sh" || warn "твики на BACKEND применены не полностью"
+  section "RELAY: состояние цепочки"
+  step_run "3x-ui: журнал доступа и DNS-журнал Xray отключены" python3 "$TMPD/relay-harden.py" || warn "журналы Xray не отключены (см. лог)"
+  step_run "chain-health, автотест после перезагрузки, проверка сертификата, счётчик соединений; путь /health в nginx убран" lscript "$TMPD/health-relay.sh" "$VER_PATH" || die "RELAY не обновлён (см. лог)"
+  install -m 755 "$TMPD/failclosed.py" /usr/local/bin/chain-failclosed
+  step_run "Перезапуск 3x-ui (применение настроек журнала)" bash -c 'systemctl restart x-ui && sleep 4 && systemctl is-active --quiet x-ui' || warn "x-ui не перезапустился"
+  section "BACKEND: мост и сторож"
+  step_run "Инструменты моста: chain-update-bridge (с откатом), chain-set-relay (с проверкой)" rscript "$TMPD/bridge-tools.sh" || die "инструменты моста не обновлены (см. лог)"
+  step_run "Сторож моста (локальный), защита моста, keepalive HTTP/2, перезапуск моста" rscript "$TMPD/watchdog-install.sh" || die "BACKEND не обновлён (см. лог)"
+  step_run "SSH-ключ RELAY для перезапуска моста (разрешена только эта команда)" setup_restart_key || warn "ключ для перезапуска моста не настроен (см. лог): RELAY не сможет сам перезапустить мост"
   sed -i "s/^VERSION=.*/VERSION=$VERSION/" "$MARKER_FILE" 2>/dev/null || true
   bk "sed -i 's/^VERSION=.*/VERSION=$VERSION/' '$MARKER_FILE' 2>/dev/null || true" >>"$LOG" 2>&1 || true
   local i
@@ -4655,13 +5635,138 @@ run_upgrade() {
   echo
   rule
   if [ "$(tunnel_conns)" -ge 1 ]; then ok "мост подключён к RELAY"; else warn "мост пока не подключён: проверьте journalctl -u chain-bridge на BACKEND"; fi
+  if [ -x /usr/local/bin/chain-failclosed ]; then
+    local fcr=0 fcout
+    fcout=$(/usr/local/bin/chain-failclosed 2>>"$LOG") || fcr=$?
+    [ -n "$fcout" ] && printf '%s\n' "$fcout" >>"$LOG"
+    case $fcr in
+      0) ok "без моста RELAY трафик пользователей в интернет не выпускает (проверено на копии настроек)" ;;
+      1) fail "УТЕЧКА: без моста трафик пользователей выходит с IP RELAY (подробности: chain-failclosed)" ;;
+      *) warn "проверка «без моста нет выхода» не выполнена (запустите chain-failclosed вручную)" ;;
+    esac
+  fi
   /usr/local/bin/chain-health --show 2>/dev/null || true
   rule
   echo "  ${B}Дальше${R}"
-  echo "   • RELAY:   chain-status, chain-health --show"
-  echo "   • BACKEND: chain-watchdog --status (решения сторожа и перезапуски), journalctl -t chain-watchdog"
-  echo "   • Сторож перезапускает мост, только если RELAY доступен, но не видит мост (около 2–3 мин) или сквозная проверка провалилась дважды (около 4–5 мин)"
+  echo "   • RELAY:   chain-status, chain-health --show, chain-incident --show (журнал сбоев), chain-failclosed"
+  echo "   • BACKEND: chain-watchdog --status, chain-incident --show"
+  echo "   • Мост пропал: BACKEND проверяет себя локально, а RELAY при потере моста на 3 минуты (или двух неудачных сквозных проверках) сам просит BACKEND перезапустить мост; всё пишется в /var/log/chain-incidents.log"
   echo
+}
+
+# ───────────────────────── обновление Xray с пробой на BACKEND ─────────────────────────
+wait_bridge() { local i; for i in $(seq 1 25); do [ "$(tunnel_conns)" -ge 1 ] && return 0; sleep 2; done; return 1; }
+selftest_retry() {  # сквозная проверка с тремя попытками; вывод — в $TMPD/st.out
+  local i
+  for i in 1 2 3; do
+    if chain_selftest >"$TMPD/st.out" 2>>"$LOG"; then return 0; fi
+    sleep 5
+  done
+  return 1
+}
+run_update_xray() {
+  INSTALL_KIND="chain"
+  STEP=0; TOTAL=4
+  if [ "$(marker_get ROLE)" = backend ]; then
+    fail "этот сервер — BACKEND: обновление Xray запускают на RELAY"
+    return 1
+  fi
+  if [ -z "${DOMAIN:-}" ] || [ ! -f /etc/nginx/sites-available/xpn.conf ]; then
+    fail "не найдены данные установки: обновление возможно только на RELAY, настроенном этим скриптом"
+    return 1
+  fi
+  local target cur_b cur_r xr px
+  for xr in /usr/local/x-ui/bin/xray-linux-*; do case "$xr" in *.prev) continue ;; esac; break; done
+  [ -x "$xr" ] || { fail "Xray из 3x-ui не найден"; return 1; }
+  cur_r=$("$xr" version 2>/dev/null | awk 'NR==1{print $2}')
+  echo
+  echo "${B}Обновление Xray на RELAY и BACKEND${R}"
+  thin
+  info "порядок: 1) проверка, что цепочка работает; 2) BACKEND — проба: обновление, сквозная проверка, при неудаче автоматический откат и остановка; 3) RELAY — загрузка и проверки на новой версии, затем замена и сквозная проверка (при неудаче откат)"
+  info "на каждом сервере сохраняется прежняя версия; при каждом перезапуске потоки оборвутся на несколько секунд"
+  ask target "Версия Xray (без v)" "$XRAY_VER"
+  target="${target#v}"
+  [[ "$target" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { fail "неверная версия: $target (нужен вид 26.10.31)"; return 1; }
+  confirm "Обновить Xray до $target?" || { echo "  Отменено."; return 0; }
+  section "Подключение к BACKEND"
+  ask_backend
+  [ "${LOCAL_BACKEND:-0}" = 1 ] || ssh_connect
+  make_scripts
+  section "Проверка перед обновлением"
+  cur_b=$(bk "/usr/local/bin/chain-update-bridge --status" 2>>"$LOG" | sed -n 's/^Xray на BACKEND: //p' | head -n1)
+  info "Xray сейчас: RELAY ${cur_r:-?}, BACKEND ${cur_b:-?}; целевая версия $target"
+  if [ "$cur_r" = "$target" ] && [ "$cur_b" = "$target" ]; then ok "на обоих серверах уже $target"; return 0; fi
+  load_user_id || { fail "не удалось прочитать клиента из базы 3x-ui"; return 1; }
+  if ! selftest_retry; then
+    fail "цепочка сейчас не работает: обновление не начато (сначала chain-test на RELAY и journalctl -u chain-bridge на BACKEND)"
+    return 1
+  fi
+  ok "цепочка работает: $(cat "$TMPD/st.out")"
+  section "BACKEND — проба"
+  if [ "$cur_b" = "$target" ]; then
+    info "на BACKEND уже $target"
+  else
+    if ! step_run "Xray на BACKEND: ${cur_b:-?} → $target (прежняя версия сохраняется)" bk "/usr/local/bin/chain-update-bridge $target"; then
+      fail "обновление на BACKEND не удалось (откат выполнен автоматически), RELAY не тронут"
+      return 1
+    fi
+    wait_bridge || warn "мост подключается дольше обычного"
+    if ! selftest_retry; then
+      bk "/usr/local/bin/chain-update-bridge --rollback" >>"$LOG" 2>&1 || true
+      bk "/usr/local/bin/chain-incident 'обновление Xray' 'сквозная проверка не прошла на версии $target' 'BACKEND возвращён на прежнюю версию'" >>"$LOG" 2>&1 || true
+      fail "на BACKEND с версией $target цепочка не работает: выполнен откат BACKEND, RELAY не тронут"
+      return 1
+    fi
+    ok "BACKEND на $target, цепочка работает"
+  fi
+  section "RELAY"
+  if [ "$cur_r" = "$target" ]; then
+    info "на RELAY уже $target"
+  else
+    px=$(github_proxy_open)
+    if ! step_run "RELAY: загрузка $target и проверки на новой версии (в том числе «без моста нет выхода»)" env ALL_PROXY="$px" bash "$TMPD/xray-update-relay.sh" prepare "$target"; then
+      github_proxy_close "$px"
+      fail "RELAY не обновлён: версия не прошла проверки; BACKEND остаётся на $target (допустимо)"
+      return 1
+    fi
+    github_proxy_close "$px"
+    if ! step_run "RELAY: установка $target и перезапуск 3x-ui (прежняя версия сохраняется)" bash "$TMPD/xray-update-relay.sh" apply; then
+      fail "RELAY не обновлён (прежняя версия возвращена автоматически)"
+      return 1
+    fi
+    wait_bridge || warn "мост подключается дольше обычного"
+    if ! selftest_retry; then
+      bash "$TMPD/xray-update-relay.sh" rollback >>"$LOG" 2>&1 || true
+      /usr/local/bin/chain-incident "обновление Xray" "сквозная проверка не прошла на RELAY с версией $target" "RELAY возвращён на прежнюю версию" >/dev/null 2>&1 || true
+      fail "на RELAY с версией $target цепочка не работает: выполнен откат RELAY"
+      return 1
+    fi
+    ok "RELAY на $target, цепочка работает"
+  fi
+  echo
+  rule
+  ok "Xray обновлён до $target на обоих серверах; прежние версии сохранены (RELAY: bin/xray-linux-*.prev; BACKEND: chain-update-bridge --rollback)"
+  rule
+}
+
+# ───────────────────────── проверка сервера на детекты ─────────────────────────
+run_detect_check() {
+  INSTALL_KIND="check"
+  local rc=0 role="роль не назначена"
+  [ -f "$MARKER_FILE" ] && role="роль $(marker_get ROLE | tr '[:lower:]' '[:upper:]')"
+  echo
+  echo "${B}Проверка сервера на детекты${R}"
+  thin
+  info "проверяется ЭТОТ сервер ($role): DNS → IP/TCP → TLS/SNI → объём данных → HTTP; затем состояние цепочки, если она настроена"
+  info "в системе ничего не меняется; займёт 1–3 минуты (с проверкой «без моста нет выхода» на RELAY — дольше); отчёт: $CHECK_REPORT"
+  confirm "Запустить проверку?" || { echo "  Отменено."; return 0; }
+  make_scripts
+  python3 "$TMPD/detect-check.py" 2>&1 | tee "$TMPD/check.out"
+  rc=${PIPESTATUS[0]}
+  ( umask 077; sed 's/\x1b\[[0-9;]*m//g' "$TMPD/check.out" > "$CHECK_REPORT" )
+  echo
+  info "отчёт сохранён: $CHECK_REPORT (права 600)"
+  return $rc
 }
 
 # ───────────────────────── откат ─────────────────────────
@@ -4674,8 +5779,12 @@ backend_uninstall() {
 
 relay_uninstall() {  # relay_uninstall rm_xui rm_web
   local rm_xui="$1" rm_web="$2" d="${DOMAIN:-$(marker_get DOMAIN)}"
-  systemctl disable --now chain-site-refresh.timer sync-sub-path.timer chain-xray-version.timer chain-xray-version.path chain-health.timer >/dev/null 2>&1 || true
-  rm -rf /var/lib/chain
+  systemctl disable --now chain-site-refresh.timer sync-sub-path.timer chain-xray-version.timer chain-xray-version.path chain-health.timer chain-certcheck.timer chain-boot-test.timer >/dev/null 2>&1 || true
+  rm -rf /var/lib/chain /var/lib/chain-incident
+  rm -f /etc/systemd/system/chain-certcheck.service /etc/systemd/system/chain-certcheck.timer /etc/systemd/system/chain-boot-test.service /etc/systemd/system/chain-boot-test.timer \
+    /usr/local/bin/chain-certcheck /usr/local/bin/chain-boot-test /usr/local/bin/chain-failclosed /usr/local/bin/chain-incident /etc/logrotate.d/chain-incidents \
+    /etc/nginx/conf.d/chain-status.conf /etc/systemd/journald.conf.d/chain-limits.conf /root/.ssh/chain-restart /root/.ssh/chain-restart.pub
+  rm -f /var/log/chain-incidents.log /var/log/chain-incidents.log.*
   rm -f /etc/systemd/system/chain-health.service /etc/systemd/system/chain-health.timer /usr/local/bin/chain-health /run/chain-health.lock
   rm -f /etc/systemd/system/chain-xray-version.service /etc/systemd/system/chain-xray-version.timer /etc/systemd/system/chain-xray-version.path \
     /usr/local/bin/chain-xray-version /etc/chain-site.endpoints
@@ -4708,7 +5817,7 @@ do_uninstall_backend() {
   thin
   echo "  ${B}BACKEND${R} (этот сервер):"
   info "мост chain-bridge и его Xray (chain-xray), команды chain-set-relay и chain-update-bridge"
-  info "сетевые настройки (BBR, буферы TCP); firewall остаётся закрытым, только SSH"
+  info "журнал сбоев, ключ перезапуска моста, сетевые настройки (BBR, буферы TCP); firewall остаётся закрытым, только SSH"
   info "RELAY этим откатом не затрагивается"
   echo
   confirm "Удалить всё перечисленное?" n || { echo "  Отменено."; return 1; }
@@ -4812,6 +5921,8 @@ main() {
     install) run_install ;;
     uninstall) do_uninstall ;;
     upgrade) run_upgrade ;;
+    update-xray) run_update_xray ;;
+    check) run_detect_check ;;
   esac
 }
 
