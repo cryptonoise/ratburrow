@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 
-RB_VERSION="4.6"
+RB_VERSION="4.7"
+COMP_VER="4.6"   # поколение компонентов на серверах (меняется, только когда меняются сами компоненты, а не текст скрипта)
 NAME="RatBurrow"
 
 set -u
@@ -205,7 +206,7 @@ BACKEND_IP=${BACKEND_IP:-}
 BACKEND_PORT=${BACKEND_PORT:-}
 DOMAIN=${DOMAIN:-}
 XUI_BY_SCRIPT=${XUI_BY_SCRIPT:-}
-COMPONENTS=$RB_VERSION
+COMPONENTS=$COMP_VER
 XRAY_VERSION=${3:-}
 XRAY_SOURCE=script
 XRAY_UPDATED=$(date +%s)
@@ -964,6 +965,87 @@ PROFEOF
 }
 
 # метки работы со скриптом на ЭТОМ сервере: подготовка сервера и настройка защищённого канала
+# Описание пути трафика для «Плана установки»
+print_reverse_tunnel_plan() {
+  local p="                 "   # отступ под подписью (как у kv)
+  printf '  %s%-14s%s %s\n' "$DIM" "Reverse Tunnel" "$R" "как идёт трафик от клиента до интернета:"
+  printf '%s%s1.%s Клиент отправляет запрос на RELAY — на ваш домен, по секретному\n' "$p" "$B" "$R"
+  printf '%s   пути, в Xray (VLESS поверх XHTTP). По любому другому пути\n' "$p"
+  printf '%s   RELAY отдаёт «живой» сайт-приманку (honeypot). Для провайдера\n' "$p"
+  printf '%s   это обычный HTTPS на сайт.\n' "$p"
+  printf '%s%s2.%s BACKEND заранее открывает туннель (Xray + XHTTP) к RELAY,\n' "$p" "$B" "$R"
+  printf '%s   и RELAY передаёт по нему запрос клиента.\n' "$p"
+  printf '%s%s3.%s BACKEND обращается к сайту со своего IP. Сайт видит BACKEND,\n' "$p" "$B" "$R"
+  printf '%s   а не вас и не RELAY.\n' "$p"
+  printf '%s%s4.%s Ответ возвращается тем же путём:\n' "$p" "$B" "$R"
+  printf '%s   BACKEND → туннель → RELAY → клиент.\n' "$p"
+  printf '\n%s%sКто что видит:%s\n' "$p" "$B" "$R"
+  printf '%s  Провайдер клиента: соединение с российским IP и вашим доменом,\n' "$p"
+  printf '%s                     внутри TLS.\n' "$p"
+  printf '%s  Сеть между серверами: одно долгое TLS-соединение\n' "$p"
+  printf '%s                     BACKEND → RELAY:443.\n' "$p"
+  printf '%s  RELAY: адреса назначения пользователей, но не содержимое HTTPS.\n' "$p"
+  printf '%s  BACKEND: адреса назначения и DNS-запросы; сайт видит IP BACKEND.\n' "$p"
+}
+
+# Список служебных команд: print_service_commands relay | backend | both
+print_service_commands() {
+  local want=${1:-both}
+  echo "  ${B}Служебные команды${R}"
+  if [ "$want" != backend ]; then
+    echo "   RELAY$([ "$want" = both ] && echo " (этот сервер)"):"
+    echo "     chain-status                 состояние цепочки: nginx, 3x-ui, подключён ли мост, сертификат, проба сайта"
+    echo "     chain-test                   сквозная проверка: клиент → туннель → BACKEND → интернет (показывает выходной IP)"
+    echo "     chain-health --show          мост, сквозная проверка, нагрузка, последние сбои (обновляется раз в 30 с)"
+    echo "     chain-incident --show [N]    журнал сбоев /var/log/chain-incidents.log: что упало и почему"
+    echo "     chain-failclosed             проверка: без моста RELAY не выпускает трафик пользователей в интернет"
+    echo "     chain-certcheck              срок сертификата и пробное продление (то же делает таймер раз в неделю)"
+    echo "     chain-boot-test              автотест после перезагрузки (запускается сам через 3 минуты после старта)"
+    echo "     chain-set-backend IP|any     сменить IP BACKEND, которому разрешён туннельный путь (any — без ограничения)"
+    echo "     chain-site-refresh           обновить страницы «живого» сайта (то же делает таймер раз в 5 минут)"
+    echo "     sync-sub-path                прописать пути подписки из 3x-ui в nginx (таймер; вручную — после смены путей в панели)"
+    echo "     chain-xray-version           записать версию Xray релея (срабатывает сама при обновлении ядра панели)"
+  fi
+  if [ "$want" != relay ]; then
+    echo "   BACKEND$([ "$want" = both ] && echo ":" || echo " (этот сервер):")"
+    echo "     chain-set-relay IP           указать новый IP RELAY (если мост не подключится за 40 с, прежний адрес вернётся)"
+    echo "     chain-update-bridge [ВЕРСИЯ|--rollback|--status]   Xray моста: к версии RELAY или к указанной (прежняя сохраняется, при неудаче откат), --rollback — вернуть прежнюю"
+    echo "     chain-watchdog --status      состояние сторожа и перезапуски моста (локальные проверки раз в минуту)"
+    echo "     chain-incident --show [N]    журнал сбоев /var/log/chain-incidents.log"
+    echo "     chain-restart-bridge         служебная команда: её вызывает RELAY по своему ключу (перезапуск моста, версия Xray), вручную не нужна"
+    echo "     systemctl status chain-bridge, journalctl -u chain-bridge   состояние и журнал моста"
+  fi
+}
+run_service_commands() {
+  local role; role=$(marker_get ROLE); role=${role:-relay}
+  echo
+  print_service_commands "$role"
+  echo
+}
+
+# Если метка осталась с пометкой «сквозная проверка не прошла» (например, мост подключился уже после проверки при установке), а цепочка сейчас
+# работает, статус исправляется и ложное предупреждение больше не показывается.
+refresh_marker_status() {
+  [ -f "$MARKER_FILE" ] || return 0
+  [ "$(marker_get STATUS)" = "check-failed" ] || return 0
+  local role rip e2e good=0
+  role=$(marker_get ROLE); role=${role:-relay}
+  if [ "$role" = backend ]; then
+    rip=$(marker_get RELAY_IP)
+    if [ -n "$rip" ] && systemctl is-active --quiet chain-bridge && ss -tnH state established "( dst $rip and dport = :443 )" 2>/dev/null | grep -q .; then good=1; fi
+  else
+    if [ "$(tunnel_conns)" -ge 1 ]; then
+      [ -x /usr/local/bin/chain-health ] && CHAIN_HEALTH_FORCE_E2E=1 /usr/local/bin/chain-health >/dev/null 2>&1
+      e2e=$(sed -n 's/^e2e=//p' /var/lib/chain/health 2>/dev/null | head -n1)
+      [ "$e2e" = ok ] && good=1
+    fi
+  fi
+  if [ "$good" -eq 1 ]; then
+    marker_set STATUS "done"
+    info "метка была с пометкой «сквозная проверка не прошла», сейчас цепочка работает — статус исправлен"
+  fi
+}
+
 show_marks() {
   local pf=0 cf=0 role st
   [ -f "$PREP_MARKER_FILE" ] && pf=1
@@ -997,6 +1079,7 @@ menu() {
   if [ $has -eq 1 ] && [ "$role" != backend ] && [ "${XRAY_MISMATCH:-0}" = 1 ]; then   # только если версии Xray на серверах различаются
     keys+=(update-xray); labels+=("Обновить Xray на обоих серверах: версии различаются (проба на BACKEND, откат при неудаче)")
   fi
+  if [ $has -eq 1 ]; then keys+=(commands); labels+=("Служебные команды"); fi
   if [ $has -eq 1 ]; then keys+=(uninstall); labels+=("Откат"); fi   # «Откат» всегда последний пункт
   echo
   echo "${B}Что делаем?${R}"
@@ -4998,18 +5081,6 @@ xui_stage() {
       systemctl restart x-ui >>"$LOG" 2>&1 || die "не удалось задать данные панели"
   fi
   [ -n "$xt" ] || xt=$(/usr/local/x-ui/x-ui setting -getApiToken 2>>"$LOG" | grep -Eo 'apiToken: .+' | awk '{print $2}')
-  echo
-  rule
-  printf '  %sPanel Installation Complete!%s\n' "$GRN" "$R"
-  rule
-  printf '%sUsername:    %s%s\n' "$GRN" "$xu" "$R"
-  printf '%sPassword:    %s%s\n' "$GRN" "$xp" "$R"
-  printf '%sPort:        %s%s\n' "$GRN" "$PANEL_PORT" "$R"
-  printf '%sWebBasePath: %s%s\n' "$GRN" "$xw" "$R"
-  printf '%sDatabase:    SQLite (/etc/x-ui/x-ui.db)%s\n' "$GRN" "$R"
-  printf '%sAccess URL:  http://127.0.0.1:%s/%s%s\n' "$GRN" "$PANEL_PORT" "$xw" "$R"
-  printf '%sAPI Token:   %s%s\n' "$GRN" "${xt:-—}" "$R"
-  rule
 }
 
 # инбаунды и маршрутизация в 3x-ui; результат: CHAIN_USER_ID, CHAIN_SUB_ID, TUNNEL_UUID
@@ -5238,7 +5309,6 @@ run_install() {
   kv "RELAY" "$RELAY_IP  (nginx, 3x-ui, Honeypot; ufw: SSH, 80, 443)"
   kv "BACKEND" "$BACKEND_IP  (SSH :$BACKEND_PORT; мост Xray сам подключается к RELAY)"
   kv "Domain" "$DOMAIN"
-  kv "Channel" "клиент → https://$DOMAIN:443 (VLESS + XHTTP, HTTP/2) → RELAY ⇄ обратный туннель ⇄ BACKEND → интернет"
   kv "Honeypot" "https://$DOMAIN/ — сайт на RELAY + 2–5 служебных эндпоинтов (случайный набор при установке); чужие пути — 404"
   kv "Subscription" "название в клиентах: $SUB_TITLE; инбаунды панели: VPN (пользователи), TUNNEL (служебный)"
   if [ $HIDE_PANEL -eq 1 ]; then
@@ -5246,9 +5316,8 @@ run_install() {
   else
     kv "3x-ui panel" "https://$DOMAIN/<WebBasePath> → RELAY 127.0.0.1:$PANEL_PORT; подписка для Incy там же"
   fi
-  kv "Tunnel" "BACKEND → RELAY:443, TLS 1.3, отпечаток Chrome, padding 100-1000 Б; секретный путь принимает только IP BACKEND; версия Xray моста — вручную (chain-update-bridge)"
   kv "E-mail" "$EMAIL"
-  kv "BACKEND ports" "все входящие закрываются, остаётся только SSH"
+  print_reverse_tunnel_plan
   rule
   echo
   confirm "Всё верно, начать установку?" || { echo "  Отменено."; exit 0; }
@@ -5412,18 +5481,24 @@ run_install() {
   if [ $CHECK_FAIL -eq 1 ]; then printf '  %sУСТАНОВКА ЗАВЕРШЕНА С ОШИБКОЙ: цепочка не пропускает трафик%s\n' "$YLW" "$R"; else printf '  %sУСТАНОВКА ЗАВЕРШЕНА%s\n' "$GRN" "$R"; fi
   rule
   printf '  %sСАЙТ HONEYPOT%s\n' "$B" "$R"
-  printf '  URL:       %shttps://%s/%s\n' "$B" "$DOMAIN" "$R"
+  printf '  URL:       %shttps://%s/%s\n' "$GRN" "$DOMAIN" "$R"
   printf '  Каталог:   %s/var/www/honeypot/%s%s (RELAY)\n' "$DIM" "$DOMAIN" "$R"
   if [ "$site_code" = "200" ]; then ok "Проверка сайта: HTTP 200"; else warn "Проверка сайта вернула HTTP ${site_code:-000}; проверьте DNS, nginx и лог"; fi
   echo
   printf '  %sПАНЕЛЬ 3X-UI%s\n' "$B" "$R"
-  if [ "$HIDE_PANEL" -eq 1 ]; then printf '  URL:       %s%s%s\n' "$B" "$tun_url" "$R"; else printf '  URL:       %s%s%s\n' "$B" "$panel_url" "$R"; fi
+  if [ "$HIDE_PANEL" -eq 1 ]; then
+    printf '  SSH подключение: %s%s%s\n' "$GRN" "$tun_cmd" "$R"
+    printf '  %s(замените ПУТЬ_К_КЛЮЧУ на путь к приватному ключу; окно с туннелем оставьте открытым)%s\n' "$DIM" "$R"
+    printf '  URL:       %s%s%s\n' "$GRN" "$tun_url" "$R"
+  else
+    printf '  URL:       %s%s%s\n' "$GRN" "$panel_url" "$R"
+  fi
   printf '  Username:  %s%s%s\n' "$GRN" "$xu" "$R"
   printf '  Password:  %s%s%s\n' "$GRN" "$xp" "$R"
   echo
   printf '  %sКЛИЕНТ (Incy)%s\n' "$B" "$R"
-  printf '  Подписка:  %shttps://%s%s%s%s\n' "$B" "$DOMAIN" "${SUB_PATHS:-/}" "$CHAIN_SUB_ID" "$R"
-  [ -n "$link" ] && printf '  Ссылка:    %s%s%s\n' "$DIM" "$link" "$R"
+  printf '  Подписка:  %shttps://%s%s%s%s\n' "$GRN" "$DOMAIN" "${SUB_PATHS:-/}" "$CHAIN_SUB_ID" "$R"
+  [ -n "$link" ] && printf '  Ссылка:    %s%s%s\n' "$GRN" "$link" "$R"
   echo
   printf '  %sТУННЕЛЬ%s\n' "$B" "$R"
   if [ "$(tunnel_conns)" -ge 1 ]; then ok "BACKEND → RELAY: мост подключён"; else warn "мост не подключён"; fi
@@ -5431,31 +5506,7 @@ run_install() {
   echo "  ${DIM}Отчёт: $REPORT_FILE (права 600)${R}"
   echo "  ${DIM}Лог:   $LOG${R}"
   echo
-  echo "  ${B}Служебные команды${R}"
-  echo "   RELAY (этот сервер):"
-  echo "     chain-status                 состояние цепочки: nginx, 3x-ui, подключён ли мост, сертификат, проба сайта"
-  echo "     chain-test                   сквозная проверка: клиент → туннель → BACKEND → интернет (показывает выходной IP)"
-  echo "     chain-set-backend IP|any     сменить IP BACKEND, которому разрешён туннельный путь (any — без ограничения)"
-  echo "     chain-site-refresh           обновить страницы «живого» сайта (то же делает таймер раз в 5 минут)"
-  echo "     sync-sub-path                прописать пути подписки из 3x-ui в nginx (таймер; вручную — после смены путей в панели)"
-  echo "     chain-xray-version           записать версию Xray релея (срабатывает сама при обновлении ядра панели)"
-  echo "     chain-health --show          состояние цепочки: мост, сквозная проверка, нагрузка, последние сбои (обновляется раз в 30 с)"
-  echo "     chain-incident --show [N]    журнал сбоев /var/log/chain-incidents.log: что упало и почему"
-  echo "     chain-failclosed             проверка: без моста RELAY не выпускает трафик пользователей в интернет"
-  echo "     chain-certcheck              срок сертификата и пробное продление (то же делает таймер раз в неделю)"
-  echo "   BACKEND:"
-  echo "     chain-set-relay IP           указать новый IP RELAY (если мост не подключится за 40 с, прежний адрес вернётся)"
-  echo "     chain-update-bridge [ВЕРСИЯ|--rollback|--status]   Xray моста: к версии RELAY или к указанной (прежняя сохраняется, при неудаче откат), --rollback — вернуть прежнюю"
-  echo "     chain-watchdog --status      состояние сторожа и перезапуски моста (локальные проверки раз в минуту)"
-  echo "     chain-incident --show [N]    журнал сбоев /var/log/chain-incidents.log"
-  echo "     systemctl status chain-bridge, journalctl -u chain-bridge   состояние и журнал моста"
-  echo
-  echo "  ${B}Открыть панель (выполните на СВОЁМ компьютере):${R}"
-  echo "   1) создать туннель — строка целиком, замените только ПУТЬ_К_КЛЮЧУ на путь к приватному ключу"
-  echo "      (старая запись известных хостов удаляется автоматически, подтверждать «yes» не нужно; окно оставьте открытым):"
-  printf '      %s%s%s\n' "$GRN" "$tun_cmd" "$R"
-  echo "   2) открыть в браузере:"
-  printf '      %s%s%s\n' "$GRN" "$tun_url" "$R"
+  print_service_commands both
   echo
   echo "  ${B}Дальше:${R}"
   echo "   • В Incy добавьте подписку по ссылке выше; новых пользователей создавайте в панели в инбаунде VPN"
@@ -5471,11 +5522,11 @@ run_install() {
 component_markers() {
   local lv bv now; now=$(date +%s)
   lv=$(local_xray_version); bv=$(backend_xray_version)
-  marker_set_backend COMPONENTS "$RB_VERSION"
+  marker_set_backend COMPONENTS "$COMP_VER"
   [ -n "$bv" ] && { marker_set_backend XRAY_VERSION "$bv"; marker_set_backend XRAY_SOURCE detected; marker_set_backend XRAY_UPDATED "$now"; marker_set_backend PEER_XRAY_VERSION "${lv:-}"; marker_set_backend PEER_XRAY_SEEN "$now"; }
   [ -n "$lv" ] && { marker_set XRAY_VERSION "$lv"; marker_set XRAY_SOURCE detected; marker_set XRAY_UPDATED "$now"; }
   [ -n "$bv" ] && { marker_set PEER_XRAY_VERSION "$bv"; marker_set PEER_XRAY_SEEN "$now"; }
-  marker_set COMPONENTS "$RB_VERSION"   # RELAY — последним: пока его нет, RELAY не обращается к BACKEND командой «версия»
+  marker_set COMPONENTS "$COMP_VER"   # RELAY — последним: пока его нет, RELAY не обращается к BACKEND командой «версия»
 }
 run_component_update() {
   INSTALL_KIND="chain"
@@ -5485,7 +5536,7 @@ run_component_update() {
     return 1
   fi
   echo
-  echo "${B}Обновление компонентов до v$RB_VERSION${R}"
+  echo "${B}Обновление компонентов до v$COMP_VER${R}"
   thin
   info "RELAY: chain-health запоминает версию Xray в метке (в том числе после обновления через панель 3x-ui); с BACKEND версия сверяется только при запуске скрипта; изменения — в журнале сбоев"
   info "BACKEND: сторож запоминает версию Xray моста; при запуске скрипта RELAY спрашивает её по тому же ограниченному SSH-ключу (команда «версия»)"
@@ -5505,7 +5556,7 @@ run_component_update() {
   step_run "Версии Xray и версия компонентов записаны в метку на RELAY и BACKEND" component_markers || warn "метка обновлена не полностью"
   echo
   rule
-  ok "компоненты обновлены до v$RB_VERSION"
+  ok "компоненты обновлены до v$COMP_VER"
   /usr/local/bin/chain-health --show 2>/dev/null || true
   rule
   echo
@@ -5514,7 +5565,7 @@ run_component_update() {
 components_old() {  # метка есть, а версии компонентов нет или она старше текущей
   local c; c=$(marker_get COMPONENTS)
   [ -z "$c" ] && return 0
-  [ "$c" != "$RB_VERSION" ] && [ "$(printf '%s\n%s\n' "$c" "$RB_VERSION" | sort -V | head -n1)" = "$c" ]
+  [ "$c" != "$COMP_VER" ] && [ "$(printf '%s\n%s\n' "$c" "$COMP_VER" | sort -V | head -n1)" = "$c" ]
 }
 
 # Версии Xray при запуске на RELAY: версия RELAY записывается в метку (в том числе после обновления вне скрипта), версия BACKEND спрашивается по
@@ -5816,6 +5867,7 @@ main() {
   banner
 
   preflight
+  refresh_marker_status
   show_marks
   startup_checks
   menu
@@ -5824,6 +5876,7 @@ main() {
     install) run_install ;;
     uninstall) do_uninstall ;;
     update-xray) run_update_xray ;;
+    commands) run_service_commands ;;
   esac
 }
 
