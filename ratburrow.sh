@@ -1,7 +1,5 @@
 #!/usr/bin/env bash
-
-RB_VERSION="4.7"
-COMP_VER="4.6"   # поколение компонентов на серверах (меняется, только когда меняются сами компоненты, а не текст скрипта)
+RB_VERSION="4.8"
 NAME="RatBurrow"
 
 set -u
@@ -206,7 +204,7 @@ BACKEND_IP=${BACKEND_IP:-}
 BACKEND_PORT=${BACKEND_PORT:-}
 DOMAIN=${DOMAIN:-}
 XUI_BY_SCRIPT=${XUI_BY_SCRIPT:-}
-COMPONENTS=$COMP_VER
+COMPONENTS=$RB_VERSION
 XRAY_VERSION=${3:-}
 XRAY_SOURCE=script
 XRAY_UPDATED=$(date +%s)
@@ -999,6 +997,7 @@ print_service_commands() {
     echo "     chain-health --show          мост, сквозная проверка, нагрузка, последние сбои (обновляется раз в 30 с)"
     echo "     chain-incident --show [N]    журнал сбоев /var/log/chain-incidents.log: что упало и почему"
     echo "     chain-failclosed             проверка: без моста RELAY не выпускает трафик пользователей в интернет"
+    echo "     chain-speedtest [--quick|--size МБ]   скорость цепочки, измеренная на RELAY (без вашего канала до RELAY): вниз/вверх по профилям отправки, загрузка процессора"
     echo "     chain-certcheck              срок сертификата и пробное продление (то же делает таймер раз в неделю)"
     echo "     chain-boot-test              автотест после перезагрузки (запускается сам через 3 минуты после старта)"
     echo "     chain-set-backend IP|any     сменить IP BACKEND, которому разрешён туннельный путь (any — без ограничения)"
@@ -3738,6 +3737,8 @@ def stream(path, ext=None, obfs=False, xmux=False, mode=None):
         # hKeepAlivePeriod: через столько секунд клиент проверяет «зависшее» соединение (+15 с ожидания ответа),
         # то есть это и есть время до восстановления после обрыва: не увеличивать
         xh["xmux"] = {"maxConnections": 2, "hMaxRequestTimes": "600-900", "hMaxReusableSecs": "1800-3000", "hKeepAlivePeriod": 20}
+        xh["scMaxEachPostBytes"] = "1200000-2000000"   # размер POST (серверу нужен лимит не меньше, иначе крупные POST отвергаются)
+        xh["scMinPostsIntervalMs"] = "8-14"            # пауза между POST: 30 мс по умолчанию ограничивает отдачу примерно 200 Мбит/с
     s = {"network": "xhttp", "security": "none", "xhttpSettings": xh}
     if ext:
         s["externalProxy"] = ext
@@ -4527,6 +4528,7 @@ cat > /usr/local/bin/chain-restart-bridge <<'EOT_RB'
 reason=${SSH_ORIGINAL_COMMAND:-}
 [ "$reason" = ping ] && { echo "ключ работает"; exit 0; }
 [ "$reason" = version ] && { /usr/local/bin/chain-xray version 2>/dev/null | awk 'NR==1{print "xray="$2}'; exit 0; }
+[ "$reason" = cpu ] && { read -r _ u1 n1 s1 i1 w1 q1 f1 _ < /proc/stat; sleep 4; read -r _ u2 n2 s2 i2 w2 q2 f2 _ < /proc/stat; t=$(( (u2+n2+s2+i2+w2+q2+f2) - (u1+n1+s1+i1+w1+q1+f1) )); b=$(( t - (i2+w2-i1-w1) )); if [ "$t" -gt 0 ]; then echo "cpu=$(( 100*b/t ))"; else echo "cpu=0"; fi; exit 0; }
 case "$reason" in
   no-bridge) why="RELAY не видит соединений моста" ;;
   e2e-fail) why="сквозная проверка на RELAY не прошла" ;;
@@ -4973,6 +4975,283 @@ if __name__ == "__main__":
     sys.exit(main())
 __CHAIN_EOF_FAILCLOSED_PY__
 
+  cat > "$D/speedtest.py" <<'__CHAIN_EOF_SPEEDTEST_PY__'
+#!/usr/bin/env python3
+# chain-speedtest — скорость цепочки, измеренная на RELAY (без вашей линии до RELAY): клиент на RELAY → nginx → туннель → BACKEND → интернет.
+# Измеряется скорость «вниз» и «вверх» для двух профилей отправки, чтобы было видно, что даёт настройка:
+#   прежний — POST 1 МБ и пауза 30 мс (значения Xray по умолчанию, так работают клиенты без настройки);
+#   текущий — параметры из инбаунда пользователей, то есть то, что клиенты получают с подпиской.
+# Использование: chain-speedtest [--size МБ] [--quick] [--check]
+#   --size N   объём передачи в каждую сторону (по умолчанию 40 МБ);  --quick — 15 МБ
+#   --check    быстрая проверка для автоматики: передача 6 МБ в обе стороны с текущим профилем; код возврата 0 — работает, 1 — нет
+# Меняются только временные процессы: рабочие настройки и клиенты не затрагиваются.
+import json, os, re, signal, socket, sqlite3, subprocess, sys, tempfile, threading, time
+
+ARGS = sys.argv[1:]
+CHECK = "--check" in ARGS
+QUICK = "--quick" in ARGS
+SIZE_MB = 6 if CHECK else (15 if QUICK else 40)
+if "--size" in ARGS:
+    try:
+        SIZE_MB = max(2, int(ARGS[ARGS.index("--size") + 1]))
+    except (ValueError, IndexError):
+        print("использование: chain-speedtest [--size МБ] [--quick] [--check]"); sys.exit(2)
+CONF = os.environ.get("CHAIN_SETUP_CONF", "/root/.chain-setup.conf")
+DB = os.environ.get("CHAIN_XUI_DB", "/etc/x-ui/x-ui.db")
+ADDR = os.environ.get("CHAIN_SPEED_ADDR", "127.0.0.1")
+PORT = int(os.environ.get("CHAIN_SPEED_PORT", "443"))
+PIN = os.environ.get("CHAIN_SPEED_PIN", "")                     # только для тестового стенда
+DOWN = os.environ.get("CHAIN_SPEED_DOWN_URL", "https://speed.cloudflare.com/__down?bytes={bytes}")
+UP = os.environ.get("CHAIN_SPEED_UP_URL", "https://speed.cloudflare.com/__up")
+SKIP_BRIDGE = os.environ.get("CHAIN_SPEED_SKIP_BRIDGE_CHECK") == "1"
+KEY = os.environ.get("CHAIN_RESTART_KEY", "/root/.ssh/chain-restart")
+SOCKS = 21486
+OLD = {"scMaxEachPostBytes": "1000000", "scMinPostsIntervalMs": "30"}
+
+
+def conf(k):
+    try:
+        for line in open(CONF, encoding="utf-8"):
+            if line.startswith(k + "="):
+                return line.split("=", 1)[1].strip()
+    except OSError:
+        pass
+    return ""
+
+
+def xray_bin():
+    b = os.environ.get("CHAIN_XRAY_BIN")
+    if b:
+        return b
+    import glob
+    for p in sorted(glob.glob("/usr/local/x-ui/bin/xray-linux-*")):
+        if not p.endswith(".prev"):
+            return p
+    return ""
+
+
+def cpu_sample():
+    with open("/proc/stat") as f:
+        v = [int(x) for x in f.readline().split()[1:8]]
+    return sum(v) - v[3] - v[4], sum(v)
+
+
+def cpu_pct(a, b):
+    return 100.0 * (b[0] - a[0]) / max(1, b[1] - a[1])
+
+
+def backend_cpu(out, key):
+    """Загрузка процессора BACKEND за время передачи: команда «cpu» ограниченного ключа (если компоненты BACKEND обновлены)."""
+    ip, port = conf("BACKEND_IP"), conf("BACKEND_PORT") or "22"
+    if not ip or not os.access(KEY, os.R_OK):
+        return
+    try:
+        r = subprocess.run(["ssh", "-i", KEY, "-p", port, "-o", "BatchMode=yes", "-o", "IdentitiesOnly=yes", "-o", "StrictHostKeyChecking=yes",
+                            "-o", "ConnectTimeout=8", "root@" + ip, "cpu"], capture_output=True, text=True, timeout=20)
+        m = re.search(r"cpu=(\d+)", r.stdout)
+        if m:
+            out[key] = int(m.group(1))
+    except Exception:
+        pass
+
+
+def bridge_conns():
+    r = subprocess.run('ss -tnH state established "( sport = :21444 )" 2>/dev/null | wc -l', shell=True, capture_output=True, text=True)
+    return int((r.stdout or "0").strip() or 0)
+
+
+def client_cfg(xh, uid, domain):
+    tls = {"serverName": domain, "fingerprint": "chrome", "alpn": ["h2"]}
+    if PIN:
+        tls["pinnedPeerCertSha256"] = PIN
+    return {"log": {"loglevel": "none"},
+            "inbounds": [{"listen": "127.0.0.1", "port": SOCKS, "protocol": "socks", "settings": {"udp": False}}],
+            "outbounds": [{"protocol": "vless", "settings": {"address": ADDR, "port": PORT, "id": uid, "encryption": "none"},
+                           "streamSettings": {"network": "xhttp", "security": "tls", "tlsSettings": tls, "xhttpSettings": xh}}]}
+
+
+def curl(args, timeout):
+    r = subprocess.run(["curl", "-s", "-o", "/dev/null", "--max-time", str(timeout), "--socks5-hostname", "127.0.0.1:%d" % SOCKS,
+                        "-w", "%{speed_download} %{speed_upload} %{http_code} %{size_download} %{size_upload}"] + args, capture_output=True, text=True)
+    f = (r.stdout.strip().split() + ["0"] * 5)[:5]
+    return float(f[0]), float(f[1]), f[2], int(float(f[3])), int(float(f[4]))
+
+
+def measure(name, xh, uid, domain, xb, tmp, backend=True):
+    """Возвращает словарь с результатами одного профиля."""
+    cfgp = os.path.join(tmp, "c.json")
+    json.dump(client_cfg(xh, uid, domain), open(cfgp, "w"))
+    t = subprocess.run([xb, "run", "-test", "-c", cfgp], capture_output=True, text=True)
+    if t.returncode != 0:
+        return {"name": name, "err": "Xray не принял тестовую конфигурацию: " + ((t.stdout + t.stderr).strip().splitlines() or ["?"])[-1][:120]}
+    p = subprocess.Popen([xb, "run", "-c", cfgp], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    res = {"name": name}
+    try:
+        for _ in range(40):
+            try:
+                socket.create_connection(("127.0.0.1", SOCKS), timeout=0.3).close()
+                break
+            except OSError:
+                time.sleep(0.15)
+        else:
+            res["err"] = "тестовый клиент не запустился"
+            return res
+        n = SIZE_MB * 1000000
+        tmo = max(40, SIZE_MB * 4)
+        bk = {}
+        # скачивание
+        c0 = cpu_sample(); th = threading.Thread(target=backend_cpu, args=(bk, "down")) if backend else None
+        if th: th.start()
+        sd, _, code, got, _ = curl([DOWN.format(bytes=n)], tmo)
+        c1 = cpu_sample()
+        if th: th.join()
+        res.update(down=sd * 8 / 1e6, down_code=code, down_got=got, cpu_relay_down=cpu_pct(c0, c1))
+        # отдача
+        fp = os.path.join(tmp, "up.bin")
+        with open(fp, "wb") as f:
+            for _ in range(SIZE_MB):
+                f.write(os.urandom(1000000))
+        c0 = cpu_sample(); th = threading.Thread(target=backend_cpu, args=(bk, "up")) if backend else None
+        if th: th.start()
+        _, su, code, _, sent = curl(["-X", "POST", "--data-binary", "@" + fp, UP], tmo)
+        c1 = cpu_sample()
+        if th: th.join()
+        os.unlink(fp)
+        res.update(up=su * 8 / 1e6, up_code=code, up_sent=sent, cpu_relay_up=cpu_pct(c0, c1), cpu_backend_down=bk.get("down"), cpu_backend_up=bk.get("up"))
+    finally:
+        p.send_signal(signal.SIGTERM)
+        try:
+            p.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            p.kill()
+    return res
+
+
+def main():
+    domain = conf("DOMAIN")
+    xb = xray_bin()
+    if not domain or not xb or not os.access(xb, os.X_OK):
+        print("нет данных установки или Xray из 3x-ui: запускать на RELAY, настроенном этим скриптом"); return 2
+    try:
+        db = sqlite3.connect(DB, timeout=10)
+        st, se = db.execute("select stream_settings, settings from inbounds where port = 21443 limit 1").fetchone()
+        xh = json.loads(st)["xhttpSettings"]
+        uid = json.loads(se)["clients"][0]["id"]
+    except Exception as e:
+        print("не удалось прочитать инбаунд пользователей из базы 3x-ui: %s" % e); return 2
+    if not SKIP_BRIDGE and bridge_conns() < 1:
+        print("мост не подключён: измерять нечего (chain-status, journalctl -u chain-bridge на BACKEND)"); return 1
+    tuned = any(str(xh.get(k, OLD[k])) != OLD[k] for k in OLD)
+    with tempfile.TemporaryDirectory() as tmp:
+        if CHECK:
+            # коды возврата: 0 — текущий профиль работает; 1 — прежний работает, а текущий нет (настройку надо откатить);
+            # 3 — не прошёл ни один профиль (тестовый сервер недоступен, проверить нельзя)
+            good = lambda r: not r.get("err") and r.get("down_code") == "200" and r.get("up_code") == "200" and r.get("down", 0) > 0 and r.get("up", 0) > 0
+            cur = measure("текущий", xh, uid, domain, xb, tmp, backend=False)
+            if good(cur):
+                print("проверка скорости: вниз %.0f, вверх %.0f Мбит/с" % (cur["down"], cur["up"])); return 0
+            if tuned:
+                old = measure("прежний", dict(xh, **OLD), uid, domain, xb, tmp, backend=False)
+                if good(old):
+                    print("проверка скорости: с настроенными параметрами передача не проходит (HTTP вниз %s, вверх %s), с прежними проходит" % (cur.get("down_code"), cur.get("up_code"))); return 1
+            print("проверка скорости: тестовый сервер недоступен, проверить нельзя (%s)" % (cur.get("err") or "HTTP вниз %s, вверх %s" % (cur.get("down_code"), cur.get("up_code")))); return 3
+        print("Скорость цепочки, измеренная на RELAY (без вашего канала до RELAY), %d МБ в каждую сторону" % SIZE_MB)
+        results = []
+        old_xh = dict(xh); old_xh.update(OLD)
+        for name, x in ((("прежний (POST 1 МБ, пауза 30 мс)", old_xh),) + ((("текущий (из подписки)", xh),) if tuned else ())):
+            print("  измеряю: %s …" % name, flush=True)
+            results.append(measure(name, x, uid, domain, xb, tmp))
+    print()
+    print("  %-36s %12s %12s %10s" % ("профиль отправки", "вниз", "вверх", "вверх/вниз"))
+    for r in results:
+        if r.get("err"):
+            print("  %-36s %s" % (r["name"], r["err"])); continue
+        bad = r.get("down_code") != "200" or r.get("up_code") != "200"
+        ratio = r["up"] / r["down"] if r["down"] else 0
+        print("  %-36s %7.0f Мбит/с %7.0f Мбит/с %9.2f%s" % (r["name"], r["down"], r["up"], ratio, "   (HTTP %s/%s)" % (r.get("down_code"), r.get("up_code")) if bad else ""))
+    good = [r for r in results if not r.get("err")]
+    if not good:
+        return 1
+    cur = good[-1]
+    cp = lambda a, b: "%d%%" % a if a is not None else "—"
+    print("  процессор во время передачи: RELAY %.0f%% (вниз) / %.0f%% (вверх); BACKEND %s / %s" % (cur["cpu_relay_down"], cur["cpu_relay_up"], cp(cur.get("cpu_backend_down"), 0), cp(cur.get("cpu_backend_up"), 0)))
+    print()
+    if tuned and len(good) == 2 and good[0]["up"] > 0:
+        gain = (good[1]["up"] / good[0]["up"] - 1) * 100
+        print("  Вывод: настроенные параметры отправки дают %+.0f%% к скорости вверх." % gain)
+    elif not tuned:
+        print("  Вывод: параметры отправки в инбаунде не заданы: клиенты работают как «прежний» профиль. Запустите скрипт — он предложит обновить компоненты.")
+    hi = max(cur["cpu_relay_down"], cur["cpu_relay_up"], cur.get("cpu_backend_down") or 0, cur.get("cpu_backend_up") or 0)
+    if cur["up"] >= 0.7 * cur["down"]:
+        print("  Серверная часть не ограничивает отдачу (вверх не меньше 70%% от вниз).\n  Если на телефоне вверх заметно ниже, смотрите линию оператора и обновление подписки в приложении.")
+    elif hi >= 85:
+        print("  Упирается в процессор (до %.0f%%): нужен более мощный сервер или меньше одновременной нагрузки." % hi)
+    else:
+        print("  Вверх ниже вниз, процессор не загружен: повторите тест позже (скорость до тестового сервера и в самом интернете меняется) и сравните с --size 80.")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+__CHAIN_EOF_SPEEDTEST_PY__
+
+  cat > "$D/speed-tune.py" <<'__CHAIN_EOF_SPEED_TUNE_PY__'
+#!/usr/bin/env python3
+# Параметры отправки XHTTP в инбаунде пользователей (порт 21443): размер POST и пауза между POST.
+# Они же попадают в ссылку подписки (extra), поэтому клиенты получают их при обновлении подписки; серверу значения нужны, чтобы принимать крупные POST
+# (сервер по умолчанию отвергает POST больше 1 МБ).
+#   apply   задать значения, если они не заданы или равны значениям Xray по умолчанию (1000000 и 30); прежние значения запоминаются
+#   revert  вернуть запомненные прежние значения
+#   status  показать текущие значения
+# Значения — диапазоны, а не одно число: фиксированная пауза 30 мс — известная примета, случайный разброс её сглаживает.
+# Нужен перезапуск x-ui (его делает вызывающий скрипт). Код возврата: 0 — готово, 1 — ошибка.
+import json, os, shutil, sqlite3, sys, time
+
+DB = os.environ.get("CHAIN_XUI_DB", "/etc/x-ui/x-ui.db")
+PREV = os.environ.get("CHAIN_SPEED_TUNE_PREV", "/var/lib/chain/speed-tune.prev")
+WANT = {"scMaxEachPostBytes": "1200000-2000000", "scMinPostsIntervalMs": "8-14"}
+DEFAULT = {"scMaxEachPostBytes": "1000000", "scMinPostsIntervalMs": "30"}
+cmd = sys.argv[1] if len(sys.argv) > 1 else "status"
+if not os.path.exists(DB):
+    print("база 3x-ui не найдена: %s" % DB); sys.exit(1)
+con = sqlite3.connect(DB, timeout=30)
+row = con.execute("select id, stream_settings from inbounds where port = 21443 limit 1").fetchone()
+if not row:
+    print("инбаунд пользователей (порт 21443) не найден"); sys.exit(1)
+iid, raw = row
+ss = json.loads(raw)
+xh = ss.setdefault("xhttpSettings", {})
+def save():
+    con.execute("update inbounds set stream_settings = ? where id = ?", (json.dumps(ss, ensure_ascii=False), iid)); con.commit()
+if cmd == "status":
+    for k in WANT:
+        print("%s=%s" % (k, xh.get(k, "(не задан, по умолчанию %s)" % DEFAULT[k])))
+elif cmd == "apply":
+    prev, changed = {}, []
+    for k, v in WANT.items():
+        cur = xh.get(k)
+        if cur is None or str(cur) == DEFAULT[k]:
+            prev[k] = cur; xh[k] = v; changed.append(k)
+    if not changed:
+        print("unchanged"); sys.exit(0)
+    shutil.copy2(DB, "%s.bak-speed-%s" % (DB, time.strftime("%Y%m%d-%H%M%S")))
+    os.makedirs(os.path.dirname(PREV), exist_ok=True)
+    json.dump(prev, open(PREV, "w"))
+    save()
+    print("changed: " + ", ".join("%s=%s" % (k, WANT[k]) for k in changed))
+elif cmd == "revert":
+    if not os.path.exists(PREV):
+        print("нет сохранённых прежних значений"); sys.exit(1)
+    prev = json.load(open(PREV))
+    for k, v in prev.items():
+        if v is None: xh.pop(k, None)
+        else: xh[k] = v
+    save(); os.remove(PREV)
+    print("reverted")
+else:
+    print("использование: speed-tune.py apply|revert|status"); sys.exit(1)
+__CHAIN_EOF_SPEED_TUNE_PY__
+
   # BACKEND: firewall — только SSH (все остальные входящие закрыты)
   cat > "$D/ufw-backend.sh" <<'EOF'
 set -e
@@ -5394,9 +5673,11 @@ run_install() {
   step_run "nginx: сертификат, секретные пути, «живые» эндпоинты, автопродление (панель: $([ $HIDE_PANEL -eq 1 ] && echo скрыта || echo опубликована))" python3 "$TMPD/nginx-final.py" "$DOMAIN" "$xw" "$USER_PATH" "$TUNNEL_PATH" "$CHAIN_USER_PORT" "$CHAIN_TUNNEL_PORT" "$BACKEND_IP" "$HIDE_PANEL" "$VER_PATH" || die "не удалось включить финальный конфиг nginx"
   /usr/local/bin/sync-sub-path >>"$LOG" 2>&1 || true
   step_run "3x-ui: журнал доступа и DNS-журнал Xray отключены" python3 "$TMPD/relay-harden.py" || warn "журналы Xray не отключены (см. лог)"
+  step_run "Параметры отправки в инбаунде пользователей (POST 1,2–2 МБ, пауза 8–14 мс)" python3 "$TMPD/speed-tune.py" apply || warn "параметры отправки не заданы (см. лог)"
   step_run "Перезапуск 3x-ui (применение маршрутизации)" bash -c 'systemctl restart x-ui && sleep 4 && systemctl is-active --quiet x-ui' || warn "x-ui не перезапустился"
   step_run "chain-health, автотест после перезагрузки, проверка сертификата, счётчик соединений" lscript "$TMPD/health-relay.sh" "$VER_PATH" || warn "chain-health установлен не полностью (см. лог)"
   install -m 755 "$TMPD/failclosed.py" /usr/local/bin/chain-failclosed
+  install -m 755 "$TMPD/speedtest.py" /usr/local/bin/chain-speedtest
 
   # [10] мост на BACKEND
   section "BACKEND: мост Xray"
@@ -5522,25 +5803,26 @@ run_install() {
 component_markers() {
   local lv bv now; now=$(date +%s)
   lv=$(local_xray_version); bv=$(backend_xray_version)
-  marker_set_backend COMPONENTS "$COMP_VER"
+  marker_set_backend COMPONENTS "$RB_VERSION"
   [ -n "$bv" ] && { marker_set_backend XRAY_VERSION "$bv"; marker_set_backend XRAY_SOURCE detected; marker_set_backend XRAY_UPDATED "$now"; marker_set_backend PEER_XRAY_VERSION "${lv:-}"; marker_set_backend PEER_XRAY_SEEN "$now"; }
   [ -n "$lv" ] && { marker_set XRAY_VERSION "$lv"; marker_set XRAY_SOURCE detected; marker_set XRAY_UPDATED "$now"; }
   [ -n "$bv" ] && { marker_set PEER_XRAY_VERSION "$bv"; marker_set PEER_XRAY_SEEN "$now"; }
-  marker_set COMPONENTS "$COMP_VER"   # RELAY — последним: пока его нет, RELAY не обращается к BACKEND командой «версия»
+  marker_set COMPONENTS "$RB_VERSION"   # RELAY — последним: пока его нет, RELAY не обращается к BACKEND командой «версия»
 }
 run_component_update() {
   INSTALL_KIND="chain"
-  STEP=0; TOTAL=4
+  STEP=0; TOTAL=5
   if [ -z "${DOMAIN:-}" ] || [ -z "${VER_PATH:-}" ] || [ ! -f /etc/nginx/sites-available/xpn.conf ]; then
     fail "не найдены данные установки (домен, секретный путь, конфиг nginx): обновление возможно только на RELAY, настроенном этим скриптом"
     return 1
   fi
   echo
-  echo "${B}Обновление компонентов до v$COMP_VER${R}"
+  echo "${B}Обновление компонентов до v$RB_VERSION${R}"
   thin
   info "RELAY: chain-health запоминает версию Xray в метке (в том числе после обновления через панель 3x-ui); с BACKEND версия сверяется только при запуске скрипта; изменения — в журнале сбоев"
   info "BACKEND: сторож запоминает версию Xray моста; при запуске скрипта RELAY спрашивает её по тому же ограниченному SSH-ключу (команда «версия»)"
-  info "пользователи, пути клиентов, подписка и сертификат не меняются; мост и 3x-ui не перезапускаются"
+  info "RELAY: chain-speedtest (скорость цепочки без вашего канала до RELAY); в инбаунде пользователей задаются параметры отправки (POST 1,2–2 МБ, пауза 8–14 мс), клиенты получают их с подпиской — при неудачной проверке всё возвращается"
+  info "пользователи, пути клиентов, подписка и сертификат не меняются; 3x-ui перезапустится один раз (потоки оборвутся на несколько секунд, мост переподключится сам)"
   confirm "Обновить компоненты?" || { echo "  Отменено."; return 0; }
   section "Подключение к BACKEND"
   ask_backend
@@ -5549,14 +5831,17 @@ run_component_update() {
   section "Журнал сбоев и версии Xray на RELAY"
   step_run "Журнал сбоев на RELAY и BACKEND (записи «ИНФО»)" install_incident_log || die "журнал сбоев не обновлён (см. лог)"
   step_run "RELAY: chain-health (версия Xray, сверка с BACKEND)" lscript "$TMPD/health-relay.sh" "$VER_PATH" || die "RELAY не обновлён (см. лог)"
+  step_run "RELAY: chain-speedtest (скорость цепочки без вашего канала до RELAY)" install -m 755 "$TMPD/speedtest.py" /usr/local/bin/chain-speedtest || warn "chain-speedtest не установлен"
   section "BACKEND"
   step_run "Инструменты моста (chain-update-bridge записывает версию Xray)" rscript "$TMPD/bridge-tools.sh" || die "инструменты моста не обновлены (см. лог)"
   step_run "Сторож моста (запоминает версию Xray) и команда «версия» для RELAY" rscript "$TMPD/watchdog-install.sh" || die "BACKEND не обновлён (см. лог)"
+  section "Скорость отправки"
+  step_run "Параметры отправки в инбаунде пользователей: применение и проверка (при неудаче откат)" apply_speed_tuning || warn "параметры отправки не применены (подробности в логе); остальное обновлено"
   section "Метка установки"
   step_run "Версии Xray и версия компонентов записаны в метку на RELAY и BACKEND" component_markers || warn "метка обновлена не полностью"
   echo
   rule
-  ok "компоненты обновлены до v$COMP_VER"
+  ok "компоненты обновлены до v$RB_VERSION"
   /usr/local/bin/chain-health --show 2>/dev/null || true
   rule
   echo
@@ -5565,7 +5850,7 @@ run_component_update() {
 components_old() {  # метка есть, а версии компонентов нет или она старше текущей
   local c; c=$(marker_get COMPONENTS)
   [ -z "$c" ] && return 0
-  [ "$c" != "$COMP_VER" ] && [ "$(printf '%s\n%s\n' "$c" "$COMP_VER" | sort -V | head -n1)" = "$c" ]
+  [ "$c" != "$RB_VERSION" ] && [ "$(printf '%s\n%s\n' "$c" "$RB_VERSION" | sort -V | head -n1)" = "$c" ]
 }
 
 # Версии Xray при запуске на RELAY: версия RELAY записывается в метку (в том числе после обновления вне скрипта), версия BACKEND спрашивается по
@@ -5620,6 +5905,35 @@ startup_checks() {
     run_component_update
   fi
   xray_notice
+}
+
+# Параметры отправки (POST 1,2–2 МБ, пауза 8–14 мс) в инбаунде пользователей: применение, перезапуск x-ui, проверка (скорость и сквозная проверка),
+# откат при неудаче. Серверу значения нужны, чтобы принимать крупные POST, клиентам они приходят с подпиской.
+apply_speed_tuning() {
+  local out rc=0 i
+  out=$(python3 "$TMPD/speed-tune.py" apply 2>>"$LOG") || { echo "не удалось изменить инбаунд пользователей"; return 1; }
+  echo "$out"
+  case "$out" in unchanged*) return 0 ;; esac
+  load_user_id >/dev/null 2>&1 || true
+  systemctl restart x-ui
+  for i in $(seq 1 20); do
+    systemctl is-active --quiet x-ui && ss -tlnH "( sport = :21443 )" 2>/dev/null | grep -q . && break
+    sleep 2
+  done
+  wait_bridge || true
+  /usr/local/bin/chain-speedtest --check >"$TMPD/speedcheck.out" 2>&1 || rc=$?
+  cat "$TMPD/speedcheck.out"
+  if [ "$rc" -ne 1 ] && [ -n "${CHAIN_USER_ID:-}" ] && ! selftest_retry; then rc=1; echo "сквозная проверка после изменения не прошла"; fi
+  if [ "$rc" -eq 1 ]; then
+    python3 "$TMPD/speed-tune.py" revert >>"$LOG" 2>&1 || true
+    systemctl restart x-ui
+    for i in $(seq 1 20); do systemctl is-active --quiet x-ui && break; sleep 2; done
+    /usr/local/bin/chain-incident "скорость" "изменение параметров отправки отменено" "проверка после изменения не прошла, возвращены прежние значения" >/dev/null 2>&1 || true
+    echo "возвращены прежние значения"
+    return 1
+  fi
+  [ "$rc" -eq 3 ] && echo "тестовый сервер скорости недоступен: параметры оставлены (сквозная проверка прошла)"
+  return 0
 }
 
 # ───────────────────────── обновление Xray с пробой на BACKEND ─────────────────────────
