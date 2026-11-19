@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-RB_VERSION="4.8"
+RB_VERSION="4.9"
 NAME="RatBurrow"
 
 set -u
@@ -21,6 +21,7 @@ XRAY_VER="${XRAY_VER:-26.10.31}"   # закреплённая версия Xray 
 XUI_VER="${XUI_VER:-v3.11.0}"       # закреплённая версия панели 3x-ui для новой установки
 TOTAL=12
 STEP=0
+SUB=0; SUBL=""; INFO=""
 CHAIN_USER_ID=""; CHAIN_SUB_ID=""; TUNNEL_UUID=""; SUB_PATHS=""; TUNNEL_OBFS=0; VER_PATH=""
 
 # ───────────────────────── цвета ─────────────────────────
@@ -43,6 +44,7 @@ kv()    { printf '  %s%-14s%s %s\n' "$DIM" "$1" "$R" "$2"; }
 
 section() {
   STEP=$((STEP + 1))
+  SUB=0
   echo
   printf '%s[%d/%d]%s %s%s%s\n' "$CYN" "$STEP" "$TOTAL" "$R" "$B" "$*" "$R"
   thin
@@ -116,26 +118,119 @@ valid_port() { [[ "$1" =~ ^[0-9]+$ ]] && [ "$1" -ge 1 ] && [ "$1" -le 65535 ]; }
 version_ge() { [ "$(printf '%s\n%s\n' "$1" "$2" | sort -V | head -n1)" = "$2" ]; }
 valid_dom()  { [[ "$1" =~ ^([a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?\.)+[a-zA-Z]{2,}$ ]]; }
 
+# ── «что происходит сейчас»: строка под спиннером ──
+# Самый «молодой» не-shell потомок процесса шага: показывает, что реально выполняется
+step_proc() {  # step_proc PID
+  ps -e -o pid=,ppid=,comm= --sort=start_time 2>/dev/null | awk -v root="$1" '
+    $1 == root { d[$1] = 1; next }
+    ($2 in d)  { d[$1] = 1; if ($3 !~ /^(sh|bash|dash|timeout)$/) last = $3 }
+    END { print last }'
+}
+
+# Расшифровка процесса для человека (частые «долгие» операции на слабых серверах)
+proc_hint() {
+  case "$1" in
+    update-initramf*|mkinitramfs|cpio) echo "сборка initramfs (на слабом сервере — минуты) [$1]" ;;
+    dkms|depmod)                       echo "сборка модулей ядра [$1]" ;;
+    grub-mkconfig|update-grub*|os-prober) echo "обновление загрузчика GRUB [$1]" ;;
+    mandb|man-db)                      echo "индекс man-страниц [$1]" ;;
+    ldconfig)                          echo "кеш библиотек [$1]" ;;
+    needrestart)                       echo "проверка служб для перезапуска [$1]" ;;
+    systemctl)                         echo "перезапуск служб [$1]" ;;
+    update-ca-certi*)                  echo "обновление сертификатов [$1]" ;;
+    apt-get|apt|dpkg)                  echo "процесс: $1" ;;
+    *)                                 echo "процесс: $1" ;;
+  esac
+}
+
+# Машинный статус apt (APT::Status-Fd) → понятная строка
+apt_status_text() {  # apt_status_text ФАЙЛ
+  local line kind a pct msg
+  line=$(tail -n1 "$1" 2>/dev/null)
+  [ -n "$line" ] || return 0
+  IFS=: read -r kind a pct msg <<<"$line"
+  pct=${pct%%.*}
+  case "$kind" in
+    dlstatus)
+      msg=$(printf '%s' "$msg" | sed -E 's/Downloading file ([0-9]+) of ([0-9]+)/файл \1 из \2/; s/\(([^)]*) remaining\)/(осталось \1)/')
+      printf 'Загрузка: %s%% — %s' "$pct" "$msg" ;;
+    pmstatus)
+      msg=$(printf '%s' "$msg" | sed -E 's/^Preparing /Подготовка /; s/^Unpacking /Распаковка /; s/^Setting up /Настройка /; s/^Configuring /Настройка /; s/^Installed /Установлен /; s/^Removing /Удаление /; s/^Removed /Удалён /; s/^Running dpkg/Запуск dpkg/; s/^Processing triggers for /Обработка триггеров: /')
+      printf 'Установка: %s%% — %s' "$pct" "$msg" ;;
+  esac
+}
+
+# Последняя «живая» строка лога, появившаяся после начала шага (например, ожидание блокировки apt)
+step_logline() {  # step_logline СМЕЩЕНИЕ_ЛОГА
+  local sz
+  sz=$(stat -c %s "$LOG" 2>/dev/null || echo 0)
+  [ "$sz" -gt "$1" ] || return 0
+  tail -c 4096 "$LOG" 2>/dev/null | tr '\r\000' '\n\n' | sed 's/\x1b\[[0-9;]*[A-Za-z]//g' \
+    | grep -v '^[[:space:]]*$' | tail -n1 \
+    | sed -E 's/Waiting for cache lock: Could not get lock ([^ ]+)\. It is held by process ([0-9]+) \(([^)]*)\).*/Ожидание блокировки apt — её держит процесс \2 (\3)/'
+}
+
+# Собирает строку INFO. Вызывается из step_run и использует его локальные переменные
+# (lastsig, lastchg, proc, tick) — так работает динамическая область видимости bash.
+step_info() {  # step_info PID ФАЙЛ_СТАТУСА СМЕЩЕНИЕ_ЛОГА
+  local sig st idle
+  sig="$(stat -c %s "$2" "$LOG" 2>/dev/null | tr '\n' ' ')"
+  if [ "$sig" != "$lastsig" ]; then lastsig=$sig; lastchg=$SECONDS; fi
+  st=$(apt_status_text "$2")
+  [ -n "$st" ] || st=$(step_logline "$3")
+  if [ $((tick % 2)) -eq 0 ]; then proc=$(step_proc "$1"); fi
+  INFO=$st
+  [ -n "$proc" ] && INFO="${INFO:+$INFO · }$(proc_hint "$proc")"
+  idle=$((SECONDS - lastchg))
+  if [ "$idle" -ge 30 ]; then INFO="${INFO:+$INFO · }нет новых сообщений ${idle}с, процесс выполняется"; fi
+}
+
 # ───────────────────────── выполнение шагов с анимацией ─────────────────────────
+# Строка 1: спиннер + название + время. Строка 2: что происходит прямо сейчас
+# (прогресс apt, текущий пакет, активный процесс, ожидание блокировки).
+# Без терминала (лог/pipe) раз в минуту печатается строка-«пульс».
 step_run() {  # step_run [-s] "Описание" команда args...   (-s: при ошибке только предупреждение)
   local soft=0
   if [ "${1:-}" = "-s" ]; then soft=1; shift; fi
   local label="$1"
   shift
-  local t0=$SECONDS pid rc i=0 clr=""
-  [ -t 1 ] && clr=$'\r\033[2K'
-  ( "$@" </dev/null >>"$LOG" 2>&1 ) &
+  local t0=$SECONDS pid rc i=0 clr="" tty=0 sf off cols lab
+  local lastsig="" lastchg=$SECONDS proc="" tick=0
+  if [ -t 1 ]; then tty=1; clr=$'\r\033[2K\n\033[2K\033[A\r'; fi
+  sf=$(mktemp 2>/dev/null) || sf=/dev/null
+  off=$(stat -c %s "$LOG" 2>/dev/null || echo 0)
+  cols=$(tput cols 2>/dev/null || echo 80)
+  lab=${label:0:$((cols - 14))}
+  ( export STEP_STATUS_FILE="$sf"; "$@" ) </dev/null >>"$LOG" 2>&1 &
   pid=$!
-  if [ -t 1 ]; then
+  if [ $tty -eq 1 ]; then
     while kill -0 "$pid" 2>/dev/null; do
-      printf '\r  %s%s%s %s %s(%ds)%s\033[K' "$CYN" "${SPIN[i % 10]}" "$R" "$label" "$DIM" $((SECONDS - t0)) "$R"
+      if [ $((i % 10)) -eq 0 ]; then
+        step_info "$pid" "$sf" "$off"
+        tick=$((tick + 1))
+      fi
+      printf '\r  %s%s%s %s %s(%ds)%s\033[K\n    %s↳ %s%s\033[K\033[A' \
+        "$CYN" "${SPIN[i % 10]}" "$R" "$lab" "$DIM" $((SECONDS - t0)) "$R" \
+        "$DIM" "${INFO:0:$((cols - 8))}" "$R"
       i=$((i + 1))
       sleep 0.1
+    done
+  else
+    while kill -0 "$pid" 2>/dev/null; do
+      sleep 1
+      i=$((i + 1))
+      if [ $((i % 60)) -eq 0 ]; then
+        step_info "$pid" "$sf" "$off"
+        tick=$((tick + 1))
+        printf '    … %s (%dс)%s\n' "$label" $((SECONDS - t0)) "${INFO:+ — $INFO}"
+      fi
     done
   fi
   wait "$pid"
   rc=$?
-  # очистка строки спиннера и итог — одним printf, чтобы ничто не вклинилось между ними
+  [ "$sf" != /dev/null ] && rm -f "$sf"
+  INFO=""
+  # очистка строк спиннера и итог — одним printf, чтобы ничто не вклинилось между ними
   if [ $rc -eq 0 ]; then
     printf '%s  %s✔%s %s %s(%dс)%s\n' "$clr" "$GRN" "$R" "$label" "$DIM" $((SECONDS - t0)) "$R"
   elif [ $soft -eq 1 ]; then
@@ -146,6 +241,50 @@ step_run() {  # step_run [-s] "Описание" команда args...   (-s: �
     tail -n 12 "$LOG" | sed 's/^/    /'
   fi
   return $rc
+}
+
+# ── apt: стадии с видимым прогрессом ──
+sub() { SUB=$((SUB + 1)); SUBL="$STEP.$SUB"; }   # номер подэтапа в названии: «2.3»
+
+# apt-get с машинным статусом (fd 3 → файл шага) и лимитом в секундах (0 = без лимита)
+apt_run() {  # apt_run ЛИМИТ_СЕК аргументы apt-get...
+  local lim="$1"; shift
+  timeout --foreground "$lim" apt-get "${APT_OPTS[@]}" \
+    -o Acquire::Retries=3 -o Acquire::http::Timeout=60 -o Acquire::https::Timeout=60 \
+    -o APT::Status-Fd=3 "$@" 3>>"${STEP_STATUS_FILE:-/dev/null}"
+}
+
+# Холостой прогон: сколько пакетов будет затронуто и сколько нужно скачать
+apt_simulate() {  # apt_simulate upgrade|dist-upgrade   (результат — в $APT_SIM_FILE)
+  apt-get "${APT_OPTS[@]}" -s "$1" >"$APT_SIM_FILE" 2>&1 || { cat "$APT_SIM_FILE" >>"$LOG"; return 1; }
+}
+
+# Расчёт → загрузка → установка отдельными шагами: видно, на какой стадии идёт время
+apt_upgrade_phase() {  # apt_upgrade_phase upgrade|dist-upgrade "Название" ЛИМИТ_УСТАНОВКИ_СЕК
+  local mode="$1" title="$2" lim="${3:-0}" n r need rc
+  APT_SIM_FILE=$(mktemp) || die "не удалось создать временный файл"
+  sub; step_run "$SUBL $title: расчёт списка пакетов" apt_simulate "$mode" \
+    || { rm -f "$APT_SIM_FILE"; die "apt не смог рассчитать обновления ($mode). Подробности — в $LOG"; }
+  n=$(grep -c '^Inst ' "$APT_SIM_FILE")
+  r=$(grep -c '^Remv ' "$APT_SIM_FILE")
+  need=$(sed -n 's/^Need to get \(.*\) of archives\..*/\1/p' "$APT_SIM_FILE" | head -n1)
+  need=${need%%/*}   # «скачать / всего» → только то, что ещё не лежит в кеше
+  rm -f "$APT_SIM_FILE"
+  if [ "${n:-0}" -eq 0 ] && [ "${r:-0}" -eq 0 ]; then
+    ok "$title: обновлений нет"
+    return 0
+  fi
+  info "$title: пакетов к установке/обновлению — $n$([ "${r:-0}" -gt 0 ] && echo ", к удалению — $r")${need:+, скачать — $need}"
+  case "$need" in
+    "" | "0 B"*) ;;
+    *) sub; step_run "$SUBL $title: загрузка пакетов ($need)" apt_run 0 -d -y "$mode" \
+         || die "не удалось загрузить пакеты ($mode). Проверьте сеть и зеркала apt. Подробности — в $LOG" ;;
+  esac
+  sub; step_run "$SUBL $title: установка (пакетов: $n)" apt_run "$lim" -y "$mode" || {
+    rc=$?
+    if [ "$rc" -eq 124 ]; then die "apt $mode завис или превысил лимит $((lim / 60)) минут. Проверьте /var/log/apt/term.log и /var/log/dpkg.log; возможен незавершённый dpkg или запрос действия.";
+    else die "apt $mode завершился с ошибкой (код $rc). Подробности — в $LOG и /var/log/apt/term.log"; fi
+  }
 }
 
 die() {
@@ -688,7 +827,7 @@ run_prepare() {
 
   export DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a NEEDRESTART_SUSPEND=1 APT_LISTCHANGES_FRONTEND=none
   export PYTHONWARNINGS="ignore::SyntaxWarning"
-  local APT_OPTS=(-o DPkg::Lock::Timeout=300 -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold)
+  APT_OPTS=(-o DPkg::Lock::Timeout=300 -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold)
 
   # [1] пакетная база
   section "Проверка пакетной базы"
@@ -705,16 +844,12 @@ run_prepare() {
   fi
   ok "пакетная база в порядке"
 
-  # [2] обновление системы
+  # [2] обновление системы: каждая стадия — отдельный шаг со своим прогрессом
   section "Обновление системы"
-  step_run "Обновление списков пакетов" apt-get "${APT_OPTS[@]}" update -qq || die "apt update не удался"
-  step_run "Обновление пакетов (upgrade)" apt-get "${APT_OPTS[@]}" upgrade -y || die "apt upgrade не удался"
-  step_run "Обновление дистрибутива (dist-upgrade, лимит 30 минут)" timeout --foreground 1800 apt-get "${APT_OPTS[@]}" dist-upgrade -y || {
-    rc=$?
-    if [ "$rc" -eq 124 ]; then die "apt dist-upgrade завис или превысил лимит 30 минут. Проверьте /var/log/apt/term.log и /var/log/dpkg.log; возможен незавершённый dpkg или запрос действия.";
-    else die "apt dist-upgrade завершился с ошибкой (код $rc). Подробности — в $LOG и /var/log/apt/term.log"; fi
-  }
-  step_run "Удаление ненужных пакетов" apt-get "${APT_OPTS[@]}" autoremove -y || warn "autoremove не выполнен"
+  sub; step_run "$SUBL Обновление списков пакетов" apt_run 0 update -qq || die "apt update не удался"
+  apt_upgrade_phase upgrade "Обновление пакетов (upgrade)" 0
+  apt_upgrade_phase dist-upgrade "Обновление дистрибутива (dist-upgrade)" 1800
+  sub; step_run "$SUBL Удаление ненужных пакетов" apt_run 0 autoremove -y || warn "autoremove не выполнен"
 
   # [3] утилиты и fail2ban
   section "Установка утилит"
