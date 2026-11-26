@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-RB_VERSION="4.9"
+RB_VERSION="4.10"
 NAME="RatBurrow"
 
 set -u
@@ -3211,6 +3211,35 @@ systemctl enable --now nginx
 systemctl reload nginx
 EOF
 
+  # RELAY: nginx не должен копить освобождённую память в heap glibc (на длинных потоках heap раздувался до 1+ ГБ при ~300 МБ живых данных:
+  # динамический порог mmap в glibc растёт, крупные буферы уходят в brk-heap и фрагментируют его). Явные MALLOC_* отключают динамику:
+  # крупные выделения идут через mmap и сразу возвращаются системе; перезапуск nginx нужен, чтобы переменные попали в процесс.
+  cat > "$D/nginx-malloc.sh" <<'EOF'
+set -e
+DD=/etc/systemd/system/nginx.service.d
+mkdir -p "$DD"
+cat > "$DD/chain-malloc.conf" <<'EOT'
+[Service]
+Environment=MALLOC_MMAP_THRESHOLD_=131072
+Environment=MALLOC_TRIM_THRESHOLD_=131072
+Environment=MALLOC_ARENA_MAX=1
+EOT
+systemctl daemon-reload
+F=/etc/nginx/conf.d/chain-limit.conf
+if [ -f "$F" ]; then
+  sed -i 's/^http2_body_preread_size .*/http2_body_preread_size 1m;/; s/, 4m около 65 МБ\/с (замер на стенде)/, 1m около 16 МБ\/с (4m расходовали память nginx)/' "$F"
+fi
+nginx -t
+systemctl restart nginx
+sleep 2
+systemctl is-active --quiet nginx
+m=$(systemctl show -p MainPID --value nginx)
+w=$(pgrep -P "$m" | head -n1)
+[ -n "$w" ] || { echo "рабочий процесс nginx не найден" >&2; exit 1; }
+tr '\0' '\n' < "/proc/$w/environ" | grep -q '^MALLOC_MMAP_THRESHOLD_=' || { echo "MALLOC_* не попали в процесс nginx" >&2; exit 1; }
+echo "nginx перезапущен, MALLOC_* применены; RSS worker: $(awk '/VmRSS/{print $2" kB"}' "/proc/$w/status")"
+EOF
+
   cat > "$D/cert.sh" <<'EOF'
 DOMAIN="$1"; EMAIL="$2"
 mkdir -p /var/www/certbot
@@ -3668,8 +3697,8 @@ open("/etc/nginx/snippets/chain-headers.conf", "w").write(
     'add_header X-Request-ID $request_id always;\n')
 open("/etc/nginx/conf.d/chain-limit.conf", "w").write(
     "limit_req_zone $binary_remote_addr zone=chain_site:10m rate=10r/s;\nlimit_req_status 429;\n"
-    "# окно приёма HTTP/2 на поток (по умолчанию 64k): скорость одного потока ≈ окно / RTT: при 60 мс 64k даёт около 1 МБ/с, 4m около 65 МБ/с (замер на стенде)\n"
-    "http2_body_preread_size 4m;\n"
+    "# окно приёма HTTP/2 на поток (по умолчанию 64k): скорость одного потока ≈ окно / RTT: при 60 мс 64k даёт около 1 МБ/с, 1m около 16 МБ/с (4m расходовали память nginx: фрагментация heap)\n"
+    "http2_body_preread_size 1m;\n"
     "keepalive_requests 100000;\n")
 if not os.path.exists("/etc/nginx/chain-backend.conf"):
     open("/etc/nginx/chain-backend.conf", "w").write(
@@ -5806,6 +5835,7 @@ run_install() {
   chain_load || die "3x-ui не вернул идентификаторы инбаундов (см. лог)"
   save_conf
   step_run "nginx: сертификат, секретные пути, «живые» эндпоинты, автопродление (панель: $([ $HIDE_PANEL -eq 1 ] && echo скрыта || echo опубликована))" python3 "$TMPD/nginx-final.py" "$DOMAIN" "$xw" "$USER_PATH" "$TUNNEL_PATH" "$CHAIN_USER_PORT" "$CHAIN_TUNNEL_PORT" "$BACKEND_IP" "$HIDE_PANEL" "$VER_PATH" || die "не удалось включить финальный конфиг nginx"
+  step_run "nginx: возврат освобождённой памяти системе (MALLOC_*), окно HTTP/2 1 МБ; перезапуск nginx" lscript "$TMPD/nginx-malloc.sh" || warn "ограничение памяти nginx не применено (см. лог)"
   /usr/local/bin/sync-sub-path >>"$LOG" 2>&1 || true
   step_run "3x-ui: журнал доступа и DNS-журнал Xray отключены" python3 "$TMPD/relay-harden.py" || warn "журналы Xray не отключены (см. лог)"
   step_run "Параметры отправки в инбаунде пользователей (POST 1,2–2 МБ, пауза 8–14 мс)" python3 "$TMPD/speed-tune.py" apply || warn "параметры отправки не заданы (см. лог)"
@@ -5957,6 +5987,7 @@ run_component_update() {
   info "RELAY: chain-health запоминает версию Xray в метке (в том числе после обновления через панель 3x-ui); с BACKEND версия сверяется только при запуске скрипта; изменения — в журнале сбоев"
   info "BACKEND: сторож запоминает версию Xray моста; при запуске скрипта RELAY спрашивает её по тому же ограниченному SSH-ключу (команда «версия»)"
   info "RELAY: chain-speedtest (скорость цепочки без вашего канала до RELAY); в инбаунде пользователей задаются параметры отправки (POST 1,2–2 МБ, пауза 8–14 мс), клиенты получают их с подпиской — при неудачной проверке всё возвращается"
+  info "RELAY: nginx перезапустится с MALLOC_* (иначе память воркера раздувается до сотен МБ из-за фрагментации heap) и окном HTTP/2 1 МБ вместо 4 МБ: соединения оборвутся на несколько секунд"
   info "пользователи, пути клиентов, подписка и сертификат не меняются; 3x-ui перезапустится один раз (потоки оборвутся на несколько секунд, мост переподключится сам)"
   confirm "Обновить компоненты?" || { echo "  Отменено."; return 0; }
   section "Подключение к BACKEND"
@@ -5966,6 +5997,7 @@ run_component_update() {
   section "Журнал сбоев и версии Xray на RELAY"
   step_run "Журнал сбоев на RELAY и BACKEND (записи «ИНФО»)" install_incident_log || die "журнал сбоев не обновлён (см. лог)"
   step_run "RELAY: chain-health (версия Xray, сверка с BACKEND)" lscript "$TMPD/health-relay.sh" "$VER_PATH" || die "RELAY не обновлён (см. лог)"
+  step_run "RELAY: nginx — возврат освобождённой памяти системе (MALLOC_*), окно HTTP/2 1 МБ; перезапуск nginx" lscript "$TMPD/nginx-malloc.sh" || warn "ограничение памяти nginx не применено (см. лог)"
   step_run "RELAY: chain-speedtest (скорость цепочки без вашего канала до RELAY)" install -m 755 "$TMPD/speedtest.py" /usr/local/bin/chain-speedtest || warn "chain-speedtest не установлен"
   section "BACKEND"
   step_run "Инструменты моста (chain-update-bridge записывает версию Xray)" rscript "$TMPD/bridge-tools.sh" || die "инструменты моста не обновлены (см. лог)"
@@ -6195,6 +6227,7 @@ relay_uninstall() {  # relay_uninstall rm_xui rm_web
     /usr/local/bin/chain-status /usr/local/bin/chain-test /usr/local/bin/chain-set-backend /usr/local/bin/chain-site-refresh /usr/local/bin/sync-sub-path \
     /etc/chain-site.domain
   if [ "$rm_web" = 1 ]; then
+    rm -f /etc/systemd/system/nginx.service.d/chain-malloc.conf; rmdir /etc/systemd/system/nginx.service.d 2>/dev/null || true
     rm -f /etc/nginx/sites-enabled/xpn.conf /etc/nginx/sites-available/xpn.conf /etc/nginx/sites-enabled/apex.conf /etc/nginx/sites-available/apex.conf \
       /etc/nginx/conf.d/chain-limit.conf /etc/nginx/snippets/chain-headers.conf /etc/nginx/chain-backend.conf
     [ -n "$d" ] && { certbot delete --cert-name "$d" --non-interactive >/dev/null 2>&1 || true; rm -rf "/var/www/honeypot/$d"; }
