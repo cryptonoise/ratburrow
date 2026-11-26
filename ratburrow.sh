@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-RB_VERSION="4.11"
+RB_VERSION="4.12"
 NAME="RatBurrow"
 
 set -u
@@ -3908,6 +3908,68 @@ honeypot_generate() {
   HONEYPOT_DRYRUN=1 HONEYPOT_WEBROOT="/var/www/honeypot/$DOMAIN" bash "$TMPD/honeypot.sh" "$DOMAIN"
 }
 
+# Выбор при сбое Honeypot: 0 — повторить попытку, 1 — отменить установку с откатом
+honeypot_choice() {
+  local c
+  echo
+  echo "  ${B}1${R}. Повторить попытку"
+  echo "  ${B}2${R}. Отменить установку с откатом"
+  drain_tty
+  while true; do
+    rd -r -p "${B}?${R} Выберите вариант ${DIM}[Enter = 1]${R}: " c
+    case "${c:-1}" in
+      1) return 0 ;;
+      2) return 1 ;;
+      *) fail "введите 1 или 2" ;;
+    esac
+  done
+}
+
+# Откат незавершённой установки без вопросов (то же, что «Откат установки», оба сервера).
+# К этому моменту SSH к BACKEND уже поднят, поэтому откатываются и RELAY, и BACKEND.
+install_rollback() {
+  local rm_xui=0 rm_web=1
+  [ "${XUI_BY_SCRIPT:-1}" != 0 ] && [ -d /usr/local/x-ui ] && rm_xui=1
+  echo
+  section "Откат установки"
+  step_run "BACKEND: удаление моста, служебных команд и настроек" backend_uninstall || warn "часть действий на BACKEND не выполнена (см. лог)"
+  step_run "RELAY: удаление служебных команд, сайта, настроек сети" relay_uninstall "$rm_xui" "$rm_web" || warn "часть действий на RELAY не выполнена (см. лог)"
+  echo
+  ok "установка отменена, изменения откачены; метка установки удалена"
+  info "firewall BACKEND остался закрытым (только SSH); при необходимости: ufw allow <порт>/tcp"
+  echo "  ${DIM}Полный лог: $LOG${R}"
+  exit 1
+}
+
+# Этап Honeypot целиком: скачивание → проверка файла → генерация сайта → проверка index.html.
+# При любом сбое — выбор: повторить попытку или отменить установку с откатом.
+honeypot_stage() {
+  local why=""
+  while true; do
+    why=""
+    rm -f "$TMPD/honeypot.sh"; rm -rf "/var/www/honeypot/$DOMAIN"
+    HP_PROXY=$(github_proxy_open)
+    [ -n "$HP_PROXY" ] && [ -z "$HONEYPOT_FILE" ] && info "GitHub с RELAY недоступен: honeypot.sh качаем через BACKEND"
+    if step_run "Загрузка и проверка генератора Honeypot (honeypot.sh)" honeypot_fetch; then
+      github_proxy_close "$HP_PROXY"; HP_PROXY=""
+      if ! step_run "Генерация файлов Honeypot на RELAY" honeypot_generate; then
+        why="не удалось сгенерировать Honeypot"
+      elif ! test -s "/var/www/honeypot/$DOMAIN/index.html"; then
+        why="Honeypot не создал index.html"
+      else
+        ok "Главная страница создана: /var/www/honeypot/$DOMAIN/index.html"
+        return 0
+      fi
+    else
+      github_proxy_close "$HP_PROXY"; HP_PROXY=""
+      why="honeypot.sh недоступен или повреждён ($HONEYPOT_URL)"
+    fi
+    fail "$why"
+    if honeypot_choice; then info "повторяем попытку…"; continue; fi
+    install_rollback
+  done
+}
+
 run_install() {
   INSTALL_KIND="chain"
   STEP=0; TOTAL=11
@@ -4023,11 +4085,7 @@ run_install() {
   info "Публичный сайт: https://$DOMAIN/"
   info "Эндпоинты: $EP_LIST"
   info "Каталог сайта на RELAY: /var/www/honeypot/$DOMAIN"
-  HP_PROXY=$(github_proxy_open); [ -n "$HP_PROXY" ] && [ -z "$HONEYPOT_FILE" ] && info "GitHub с RELAY недоступен: honeypot.sh качаем через BACKEND"
-  if ! step_run "Загрузка генератора Honeypot (honeypot.sh)" honeypot_fetch; then github_proxy_close "$HP_PROXY"; HP_PROXY=""; die "не удалось скачать honeypot.sh ($HONEYPOT_URL)"; fi
-  github_proxy_close "$HP_PROXY"; HP_PROXY=""
-  step_run "Генерация файлов Honeypot на RELAY" honeypot_generate || die "не удалось сгенерировать Honeypot"
-  if test -s "/var/www/honeypot/$DOMAIN/index.html"; then ok "Главная страница создана: /var/www/honeypot/$DOMAIN/index.html"; else die "Honeypot не создал index.html"; fi
+  honeypot_stage
 
   # [7] nginx временный
   section "RELAY: nginx (временный конфиг)"
