@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # RatBurrow: служебные скрипты RELAY и BACKEND (make_scripts: создаются в $TMPD).
 # Часть основного скрипта: подключается из ratburrow.sh (source) и отдельно не запускается.
-RB_PART_VERSION="4.18"
+RB_PART_VERSION="4.19"
 if [ "${BASH_SOURCE[0]}" = "$0" ]; then echo "Это часть RatBurrow, запускайте ratburrow.sh"; exit 1; fi
 
 # ───────────────────────── скрипты установки (создаются в $TMPD) ─────────────────────────

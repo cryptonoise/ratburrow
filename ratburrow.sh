@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-RB_VERSION="4.18"
+RB_VERSION="4.19"
 NAME="RatBurrow"
 
 set -u
@@ -174,7 +174,7 @@ step_logline() {  # step_logline СМЕЩЕНИЕ_ЛОГА
   sz=$(stat -c %s "$LOG" 2>/dev/null || echo 0)
   [ "$sz" -gt "$1" ] || return 0
   tail -c 4096 "$LOG" 2>/dev/null | tr '\r\000' '\n\n' | sed 's/\x1b\[[0-9;]*[A-Za-z]//g' \
-    | grep -v '^[[:space:]]*$' | tail -n1 \
+    | tr -d '\001-\010\013\014\016-\037\177' | grep -a -v '^[[:space:]]*$' | tail -n1 \
     | sed -E 's/Waiting for cache lock: Could not get lock ([^ ]+)\. It is held by process ([0-9]+) \(([^)]*)\).*/Ожидание блокировки apt — её держит процесс \2 (\3)/'
 }
 
@@ -193,22 +193,45 @@ step_info() {  # step_info PID ФАЙЛ_СТАТУСА СМЕЩЕНИЕ_ЛОГА
   if [ "$idle" -ge 30 ]; then INFO="${INFO:+$INFO · }нет новых сообщений ${idle}с, процесс выполняется"; fi
 }
 
+# ширина терминала. tput cols внутри $(...) видит не терминал, а канал, и возвращает 80, поэтому спрашиваем сам терминал
+term_cols() {
+  local c
+  c=$(stty size </dev/tty 2>/dev/null | awk '{ print $2 }')
+  case "$c" in ''|*[!0-9]*|0) c=$(stty size <&2 2>/dev/null | awk '{ print $2 }') ;; esac
+  case "$c" in ''|*[!0-9]*|0) c=${COLUMNS:-} ;; esac
+  case "$c" in ''|*[!0-9]*|0) c=$(tput cols 2>/dev/null) ;; esac
+  case "$c" in ''|*[!0-9]*|0) c=80 ;; esac
+  echo "$c"
+}
+trunc() {  # trunc СТРОКА ДЛИНА: если не помещается, в конце многоточие
+  local s=$1 n=$2
+  [ "$n" -lt 10 ] && n=10
+  if [ "${#s}" -gt "$n" ]; then s="${s:0:$((n - 1))}…"; fi
+  printf '%s' "$s"
+}
+
 # ───────────────────────── выполнение шагов с анимацией ─────────────────────────
 # Строка 1: спиннер + название + время. Строка 2: что происходит прямо сейчас
 # (прогресс apt, текущий пакет, активный процесс, ожидание блокировки).
 # Без терминала (лог/pipe) раз в минуту печатается строка-«пульс».
-step_run() {  # step_run [-s] "Описание" команда args...   (-s: при ошибке только предупреждение)
-  local soft=0
-  if [ "${1:-}" = "-s" ]; then soft=1; shift; fi
+step_run() {  # step_run [-s] [-q] "Описание" команда args...   (-s: при ошибке только предупреждение; -q: одна строка без «что происходит сейчас»)
+  local soft=0 quiet=0
+  while [ "${1:-}" = "-s" ] || [ "${1:-}" = "-q" ]; do
+    if [ "$1" = "-s" ]; then soft=1; else quiet=1; fi
+    shift
+  done
   local label="$1"
   shift
-  local t0=$SECONDS pid rc i=0 clr="" tty=0 sf off cols lab
+  local t0=$SECONDS pid rc i=0 clr="" tty=0 sf off cols lab infotxt=""
   local lastsig="" lastchg=$SECONDS proc="" tick=0
-  if [ -t 1 ]; then tty=1; clr=$'\r\033[2K\n\033[2K\033[A\r'; fi
+  if [ -t 1 ]; then
+    tty=1
+    if [ $quiet -eq 1 ]; then clr=$'\r\033[2K'; else clr=$'\r\033[2K\n\033[2K\033[A\r'; fi
+  fi
   sf=$(mktemp 2>/dev/null) || sf=/dev/null
   off=$(stat -c %s "$LOG" 2>/dev/null || echo 0)
-  cols=$(tput cols 2>/dev/null || echo 80)
-  lab=${label:0:$((cols - 14))}
+  cols=$(term_cols)
+  lab=$(trunc "$label" $((cols - 14)))
   ( export STEP_STATUS_FILE="$sf"; "$@" ) </dev/null >>"$LOG" 2>&1 &
   pid=$!
   if [ $tty -eq 1 ]; then
@@ -216,10 +239,17 @@ step_run() {  # step_run [-s] "Описание" команда args...   (-s: �
       if [ $((i % 10)) -eq 0 ]; then
         step_info "$pid" "$sf" "$off"
         tick=$((tick + 1))
+        cols=$(term_cols)   # окно можно растянуть во время установки
+        lab=$(trunc "$label" $((cols - 14)))
+        infotxt=$(trunc "$INFO" $((cols - 8)))
       fi
-      printf '\r  %s%s%s %s %s(%ds)%s\033[K\n    %s↳ %s%s\033[K\033[A' \
-        "$CYN" "${SPIN[i % 10]}" "$R" "$lab" "$DIM" $((SECONDS - t0)) "$R" \
-        "$DIM" "${INFO:0:$((cols - 8))}" "$R"
+      if [ $quiet -eq 1 ]; then
+        printf '\r  %s%s%s %s %s(%ds)%s\033[K' "$CYN" "${SPIN[i % 10]}" "$R" "$lab" "$DIM" $((SECONDS - t0)) "$R"
+      else
+        printf '\r  %s%s%s %s %s(%ds)%s\033[K\n    %s↳ %s%s\033[K\033[A' \
+          "$CYN" "${SPIN[i % 10]}" "$R" "$lab" "$DIM" $((SECONDS - t0)) "$R" \
+          "$DIM" "$infotxt" "$R"
+      fi
       i=$((i + 1))
       sleep 0.1
     done
@@ -1233,7 +1263,7 @@ run_install() {
   CERT_OK=0
   if [ "$DNS_OK" -ne 0 ]; then warn "DNS не подтверждён — попытка выпуска может не удаться"; fi
   while true; do
-    if step_run "certbot --webroot для $DOMAIN" lscript "$TMPD/cert.sh" "$DOMAIN" "$EMAIL"; then CERT_OK=1; break; fi
+    if step_run -q "Выпуск сертификата Let's Encrypt для $DOMAIN (certbot)" lscript "$TMPD/cert.sh" "$DOMAIN" "$EMAIL"; then CERT_OK=1; break; fi
     warn "не удалось выпустить сертификат (DNS ещё не разошёлся? порт 80 недоступен?)"
     confirm "Повторить?" || break
   done
@@ -1306,7 +1336,7 @@ run_install() {
 
   # [12] firewall BACKEND и итог
   section "BACKEND: firewall и итог"
-  step_run "ufw: SSH сохранён, все остальные входящие закрыты" rscript "$TMPD/ufw-backend.sh" || warn "firewall BACKEND не настроен (см. лог)"
+  step_run -q "ufw: SSH сохранён, все остальные входящие закрыты" rscript "$TMPD/ufw-backend.sh" || warn "firewall BACKEND не настроен (см. лог)"
   if [ $CHECK_FAIL -eq 1 ]; then write_marker "check-failed"; else write_marker "done"; fi
   ok "настройки сохранены: $CONF_FILE, метка установки: $MARKER_FILE"
 
