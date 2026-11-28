@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # RatBurrow: служебные скрипты RELAY и BACKEND (make_scripts: создаются в $TMPD).
 # Часть основного скрипта: подключается из ratburrow.sh (source) и отдельно не запускается.
-RB_PART_VERSION="4.16"
+RB_PART_VERSION="4.17"
 if [ "${BASH_SOURCE[0]}" = "$0" ]; then echo "Это часть RatBurrow, запускайте ratburrow.sh"; exit 1; fi
 
 # ───────────────────────── скрипты установки (создаются в $TMPD) ─────────────────────────
@@ -189,7 +189,9 @@ cat > "$DD/chain-malloc.conf" <<'EOT'
 Environment=MALLOC_MMAP_THRESHOLD_=131072
 Environment=MALLOC_TRIM_THRESHOLD_=131072
 Environment=MALLOC_ARENA_MAX=1
-OOMScoreAdjust=-300
+OOMScoreAdjust=-500
+Restart=always
+RestartSec=2
 EOT
 systemctl daemon-reload
 F=/etc/nginx/conf.d/chain-limit.conf
@@ -224,8 +226,9 @@ install -d /usr/local/sbin
 cat > /usr/local/sbin/chain-memory <<'EOT'
 #!/bin/bash
 # chain-memory: ограничения памяти для VPS с малым ОЗУ (RELAY и BACKEND)
-#   apply     записать настройки: sysctl, zram/своп, лимиты служб, earlyoom (службы не перезапускаются)
-#   activate  перезапустить x-ui / chain-bridge, если лимиты ещё не действуют в запущенном процессе; вернуть страницы из дискового свопа в ОЗУ
+#   apply     записать настройки: sysctl, zram/своп, защита служб от OOM, снятие лимитов 4.16 (службы не перезапускаются)
+#   activate  перезапустить x-ui / chain-bridge, если в запущенном процессе остались лимиты прежних версий (GOMEMLIMIT); очистить дисковый своп
+#   diag      собрать данные о памяти (для разбора, кто её занимает)
 #   remove    убрать всё, что поставил apply
 #   status    показать текущее состояние
 exec </dev/null
@@ -310,7 +313,7 @@ write_sysctl() {
     echo "net.core.wmem_max=$buf"
     echo "net.ipv4.tcp_rmem=4096 131072 $buf"
     echo "net.ipv4.tcp_wmem=4096 65536 $buf"
-    [ "$MEM_MB" -le 3072 ] && echo "net.ipv4.tcp_mem=$(( pages * 8 / 100 )) $(( pages * 12 / 100 )) $(( pages * 18 / 100 ))"
+    [ "$MEM_MB" -le 3072 ] && echo "net.ipv4.tcp_mem=$(( pages * 10 / 100 )) $(( pages * 15 / 100 )) $(( pages * 22 / 100 ))"
     echo "net.ipv4.tcp_notsent_lowat=131072"
     echo "vm.swappiness=$sw"
     zram_active && echo "vm.page-cluster=0"
@@ -319,49 +322,45 @@ write_sysctl() {
   sysctl -q -p "$CONF" >/dev/null 2>&1 || sysctl --system >/dev/null 2>&1 || true
 }
 
-# лимиты служб: GOMEMLIMIT (мягкий потолок кучи Go: сборщик мусора работает чаще вместо роста памяти; x-ui передаёт его запускаемому Xray),
-# MemoryHigh (замедляет службу при превышении), MemoryMax (жёсткий потолок: служба перезапускается сама), OOMScoreAdjust (x-ui — первым при нехватке)
+# защита служб: x-ui, Xray и мост не должны останавливаться из-за памяти. Жёстких лимитов (MemoryMax, MemoryHigh, GOMEMLIMIT) нет:
+# они сами убивали или тормозили Xray. OOMScoreAdjust=-500 — ядро при нехватке памяти трогает их в последнюю очередь, Restart=always — служба поднимется сама
 write_limits() {
-  local gl high max u d
-  gl=$(( MEM_MB * 30 / 100 )); high=$(( MEM_MB * 55 / 100 )); max=$(( MEM_MB * 72 / 100 ))
+  local u d
   for u in $UNITS; do
     unit_exists "$u" || continue
     d=/etc/systemd/system/$u.service.d
     mkdir -p "$d"
     cat > "$d/chain-memory.conf" <<EOD
 [Service]
-Environment=GOMEMLIMIT=${gl}MiB
-MemoryHigh=${high}M
-MemoryMax=${max}M
-OOMScoreAdjust=300
+OOMScoreAdjust=-500
+Restart=always
+RestartSec=3
 EOD
-    echo "лимиты: $u (GOMEMLIMIT ${gl} МиБ, MemoryHigh ${high} МБ, MemoryMax ${max} МБ)"
+    echo "защита: $u (OOMScoreAdjust -500, автоперезапуск)"
   done
   systemctl daemon-reload
+  # лимиты, заданные версией 4.16, снимаются и у работающих служб
+  for u in $UNITS; do
+    unit_exists "$u" && systemctl is-active --quiet "$u" && systemctl set-property --runtime "$u" MemoryMax=infinity MemoryHigh=infinity >/dev/null 2>&1
+  done
+  return 0
 }
 
-# earlyoom: при нехватке памяти и свопа завершает самый тяжёлый процесс (предпочтительно xray), не трогая sshd и nginx
-setup_earlyoom() {
-  local d=/etc/systemd/system/earlyoom.service.d eo
-  if ! command -v earlyoom >/dev/null 2>&1; then
-    DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=300 install -y earlyoom >/dev/null 2>&1 \
-      || { echo "earlyoom: пакет не установился, пропущено"; return 0; }
-    : > "$EARLYOOM_MARK"
+# earlyoom (версия 4.16) убивал самый тяжёлый процесс, то есть xray: убираем
+remove_earlyoom() {
+  rm -f /etc/systemd/system/earlyoom.service.d/chain.conf
+  rmdir /etc/systemd/system/earlyoom.service.d 2>/dev/null || true
+  if [ -f "$EARLYOOM_MARK" ]; then
+    systemctl disable --now earlyoom >/dev/null 2>&1 || true
+    DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=300 purge -y earlyoom >/dev/null 2>&1 || true
+    rm -f "$EARLYOOM_MARK"
+    echo "earlyoom: удалён"
+  elif command -v earlyoom >/dev/null 2>&1; then
+    systemctl daemon-reload; systemctl restart earlyoom >/dev/null 2>&1 || true
   fi
-  eo=$(command -v earlyoom) || return 0
-  mkdir -p "$d"
-  cat > "$d/chain.conf" <<EOD
-[Service]
-ExecStart=
-ExecStart=$eo -m 5 -s 10 -r 0 --avoid ^(sshd|nginx|systemd|systemd-journal)\$\$ --prefer ^xray
-EOD
-  systemctl daemon-reload
-  systemctl enable earlyoom >/dev/null 2>&1 || true
-  systemctl restart earlyoom >/dev/null 2>&1 || true
-  systemctl is-active --quiet earlyoom && echo "earlyoom: работает" || echo "earlyoom: не запустился"
 }
 
-has_limit() {  # GOMEMLIMIT есть в окружении запущенной службы?
+stale_limit() {  # в окружении запущенной службы остался GOMEMLIMIT от версии 4.16?
   local pid
   pid=$(systemctl show -p MainPID --value "$1" 2>/dev/null)
   [ -n "$pid" ] && [ "$pid" != 0 ] && tr '\0' '\n' < "/proc/$pid/environ" 2>/dev/null | grep -q '^GOMEMLIMIT='
@@ -392,10 +391,10 @@ do_activate() {
   for u in $UNITS; do
     unit_exists "$u" && [ -f "/etc/systemd/system/$u.service.d/chain-memory.conf" ] || continue
     systemctl is-active --quiet "$u" || continue
-    has_limit "$u" && continue
+    stale_limit "$u" || continue
     systemctl restart "$u"
     for i in $(seq 1 20); do systemctl is-active --quiet "$u" && break; sleep 2; done
-    systemctl is-active --quiet "$u" && echo "перезапущен: $u (лимиты памяти применены)" || echo "ВНИМАНИЕ: $u не запустился после перезапуска" >&2
+    systemctl is-active --quiet "$u" && echo "перезапущен: $u (старые лимиты памяти сняты)" || echo "ВНИМАНИЕ: $u не запустился после перезапуска" >&2
   done
   reclaim_swap
 }
@@ -428,25 +427,38 @@ do_remove() {
   echo "ограничения памяти сняты (лимиты в уже запущенных службах исчезнут при их перезапуске)"
 }
 
+do_diag() {
+  echo "== free"; free -m
+  echo "== процессы по RSS (КБ)"; ps -eo pid,rss,comm --sort=-rss | head -8
+  echo "== cgroup x-ui"; for f in memory.current memory.max memory.high memory.events; do echo "$f: $(tr '\n' ' ' < /sys/fs/cgroup/system.slice/x-ui.service/$f 2>/dev/null)"; done
+  echo "== своп / zram"; swapon --show; zramctl 2>/dev/null
+  echo "== память сокетов TCP (страницы по 4 КБ)"; grep -E '^(TCP|sockets)' /proc/net/sockstat; sysctl net.ipv4.tcp_mem
+  echo "== ядро: slab (топ)"; slabtop -o -s c 2>/dev/null | sed -n '1,12p'
+  echo "== ядро: нехватка памяти, убитые процессы, TCP out of memory"; dmesg -T 2>/dev/null | grep -iE 'out of memory|oom-kill|killed process|tcp: out of memory' | tail -15
+  echo "== x-ui: журнал"; journalctl -u x-ui -n 25 --no-pager -o cat 2>/dev/null
+  echo "== nginx: ошибки"; tail -n 15 /var/log/nginx/error.log 2>/dev/null
+}
+
 do_status() {
   echo "ОЗУ: ${MEM_MB} МБ"; free -m | sed -n '1,3p'
   echo "своп:"; swapon --show 2>/dev/null | sed 's/^/  /'
   sysctl net.core.rmem_max net.ipv4.tcp_mem vm.swappiness 2>/dev/null | sed 's/^/  /'
   local u
   for u in $UNITS; do
-    unit_exists "$u" && echo "$u: $(has_limit "$u" && echo "GOMEMLIMIT действует" || echo "лимиты не действуют (нужен перезапуск: chain-memory activate)")"
+    unit_exists "$u" && echo "$u: $(stale_limit "$u" && echo "работает со старым GOMEMLIMIT (нужно: chain-memory activate)" || echo "ок")"
   done
-  systemctl is-active earlyoom 2>/dev/null | sed 's/^/earlyoom: /'
+  echo "cgroup x-ui: $(cat /sys/fs/cgroup/system.slice/x-ui.service/memory.current 2>/dev/null) байт, max=$(cat /sys/fs/cgroup/system.slice/x-ui.service/memory.max 2>/dev/null)"
 }
 
 [ "$#" -gt 0 ] || set -- status
 for a in "$@"; do
   case "$a" in
-    apply)    setup_swap; write_sysctl; write_limits; setup_earlyoom ;;
+    apply)    setup_swap; write_sysctl; write_limits; remove_earlyoom ;;
     activate) do_activate ;;
     remove)   do_remove ;;
     status)   do_status ;;
-    *) echo "использование: chain-memory apply|activate|remove|status" >&2; exit 1 ;;
+    diag)     do_diag ;;
+    *) echo "использование: chain-memory apply|activate|remove|status|diag" >&2; exit 1 ;;
   esac
 done
 EOT
