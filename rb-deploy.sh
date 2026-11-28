@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # RatBurrow: служебные скрипты RELAY и BACKEND (make_scripts: создаются в $TMPD).
 # Часть основного скрипта: подключается из ratburrow.sh (source) и отдельно не запускается.
-RB_PART_VERSION="4.20"
+RB_PART_VERSION="4.21"
 if [ "${BASH_SOURCE[0]}" = "$0" ]; then echo "Это часть RatBurrow, запускайте ratburrow.sh"; exit 1; fi
 
 # ───────────────────────── скрипты установки (создаются в $TMPD) ─────────────────────────
@@ -384,7 +384,8 @@ install_guard() {
 #   free      памяти много: буферы и память TCP максимальные, канал используется полностью
 #   normal    обычный режим
 #   tight     запас памяти уменьшается: буферы и память TCP сжимаются, ядро плавно уменьшает окна приёма и отправители замедляются
-#   crit      критично: то же ещё сильнее, сбрасывается кэш; при устойчивой нехватке НОВЫЕ соединения на 443 временно не принимаются (кроме BACKEND)
+#   crit      критично: то же ещё сильнее; только при очень долгой (≥10 с) и глубокой нехватке НОВЫЕ соединения на 443 временно не принимаются (кроме BACKEND)
+# Бюджет памяти TCP делится между активными потоками (много параллельных загрузок — окно каждой меньше, но все идут); tcp_mem не опускается ниже текущего расхода
 # Разрыв самых тяжёлых соединений — только в крайнем случае (память почти исчерпана и ядро не справляется). Процессы не убиваются.
 # Вверх (строже) уровень меняется быстро, вниз (свободнее) только после стабильного спада давления.
 import ctypes, os, re, shlex, shutil, signal, subprocess, sys, time
@@ -392,7 +393,7 @@ import ctypes, os, re, shlex, shutil, signal, subprocess, sys, time
 TAG = "chain-memguard"
 PORT = "443"
 STATE = "/run/chain-memguard.state"
-INTERVAL = 2.0
+INTERVAL = 1.0
 NAMES = ("free", "normal", "tight", "crit")
 
 
@@ -472,35 +473,63 @@ def listening():
 # ---------- уровни ----------
 def table(mem_mb):
     if mem_mb <= 1536:
-        mb = (32, 12, 4, 1)          # МБ на сокет (потолок автонастройки буфера)
+        mb = (16, 8, 4, 2)           # МБ на сокет (потолок автонастройки буфера)
     elif mem_mb <= 3072:
-        mb = (48, 16, 6, 2)
+        mb = (24, 12, 6, 3)
     else:
-        mb = (64, 32, 8, 2)
+        mb = (32, 16, 8, 4)
     pct = ((16, 24, 35), (12, 18, 26), (8, 12, 18), (6, 9, 12))   # tcp_mem: нижний / давление / предел, % ОЗУ
     lowat = (262144, 131072, 65536, 32768)                       # сколько неотправленных данных держит сокет
     return mb, pct, lowat
 
 
-def apply_level(idx, mem_mb):
-    mb, pct, lowat = table(mem_mb)
-    b = mb[idx] * 1048576
+def tcp_pages():
+    for line in rd("/proc/net/sockstat").splitlines():
+        if line.startswith("TCP:"):
+            m = re.search(r"\bmem (\d+)", line)
+            if m:
+                return int(m.group(1))
+    return 0
+
+
+def tcp_limits(idx, mem_mb):
     pages = mem_mb * 256
+    pct = table(mem_mb)[1][idx]
+    return [pages * p // 100 for p in pct]
+
+
+def apply_level(idx, mem_mb, active=0, cur=0):
+    # active — число «тяжёлых» потоков: общий бюджет памяти TCP делится между ними (чем больше загрузок, тем меньше окно каждой)
+    mb, pct, lowat = table(mem_mb)
+    top = mb[idx] * 1048576
+    pages = mem_mb * 256
+    lim = tcp_limits(idx, mem_mb)
+    b = top
+    if active > 1:
+        b = max(min(top, int(lim[1] * 4096 * 0.8 / active)), 1048576)
+    # tcp_mem никогда не опускаем ниже текущего расхода: иначе ядро сразу режет окна и гоняет пакеты в отказ, а загрузка обрывается по таймауту
+    floor = int(cur * 1.3)
+    lim = [max(lim[0], floor), max(lim[1], int(floor * 1.15)), max(lim[2], int(floor * 1.3))]
+    lim = [min(lim[0], pages * 40 // 100), min(lim[1], pages * 45 // 100), min(lim[2], pages * 50 // 100)]
     wr("net/core/rmem_max", str(b))
     wr("net/core/wmem_max", str(b))
     wr("net/ipv4/tcp_rmem", "4096 131072 %d" % b)
     wr("net/ipv4/tcp_wmem", "4096 65536 %d" % b)
-    wr("net/ipv4/tcp_mem", "%d %d %d" % tuple(pages * p // 100 for p in pct[idx]))
+    wr("net/ipv4/tcp_mem", "%d %d %d" % tuple(lim))
     wr("net/ipv4/tcp_notsent_lowat", str(lowat[idx]))
+    return b
 
 
-def classify(avail, some, rate, sfree):
-    if some > 25 or avail < 6 or rate > 4000 or (sfree < 12 and (some > 5 or avail < 10)):
+def classify(avail, some, rate, sfree, tcpf):
+    # tcpf — расход памяти TCP в долях от «давления» (tcp_mem[1]) текущего уровня
+    if some > 40 or avail < 4 or rate > 6000 or (sfree < 8 and (some > 10 or avail < 8)):
         return 3
-    if some > 8 or avail < 15 or rate > 1000:
+    if some > 15 or avail < 12 or rate > 1500 or tcpf > 1.0:
         return 2
-    if some < 2 and avail > 35 and rate < 200:
+    if some < 3 and avail > 35 and rate < 200 and tcpf < 0.4:
         return 0
+    if tcpf > 0.6 or some > 6 or avail < 20:
+        return 1
     return 1
 
 
@@ -528,7 +557,24 @@ def release():
                 run([t, "-w", "-D", "INPUT"] + shlex.split(line)[2:])
 
 
-def shed(n=3):
+def heavy_count():
+    # потоки, у которых в очередях накоплено > 64 КБ: это и есть активные загрузки
+    n = 0
+    for line in run(["ss", "-tnH", "state", "established", "sport", "=", ":" + PORT]).stdout.splitlines():
+        f = line.split()
+        if f and not f[0].isdigit():
+            f = f[1:]
+        if len(f) < 2:
+            continue
+        try:
+            if int(f[0]) + int(f[1]) >= 65536:
+                n += 1
+        except ValueError:
+            pass
+    return n
+
+
+def shed(n=1):
     skip = set(backend_ips())
     rows = []
     for line in run(["ss", "-tnH", "state", "established", "sport", "=", ":" + PORT]).stdout.splitlines():
@@ -543,7 +589,7 @@ def shed(n=3):
             continue
         ip, _, port = f[3].rpartition(":")
         ip = ip.strip("[]")
-        if ip in skip or ip.startswith("127.") or ip == "::1" or q < 262144:
+        if ip in skip or ip.startswith("127.") or ip == "::1" or q < 2097152:
             continue
         rows.append((q, ip, port))
     rows.sort(reverse=True)
@@ -572,7 +618,8 @@ def main():
     signal.signal(signal.SIGTERM, stop)
     release()
     level, up, down = 1, 0, 0
-    apply_level(level, mem_mb)
+    apply_level(level, mem_mb, 0, tcp_pages())
+    active, last_act, cur_buf = 0, 0.0, 0
     blocked, blocked_at, cool_until, crit_n, calm, hot, last_trim = False, 0.0, 0.0, 0, 0, 0, 0.0
     last_io, last_t = swapio(), time.time()
     while True:
@@ -589,34 +636,36 @@ def main():
             rate = (io - last_io) / max(now - last_t, 0.1)
             last_io, last_t = io, now
 
-            want = classify(avail, some, rate, sfree)
+            tp = tcp_pages()
+            tcpf = tp / max(tcp_limits(level, mem_mb)[1], 1)
+            want = classify(avail, some, rate, sfree, tcpf)
             old = level
             if want > level:
                 up, down = up + 1, 0
-                if up >= (1 if want == 3 else 2):
+                if up >= (1 if want == 3 else 3):
                     level, up = want, 0
             elif want < level:
                 down, up = down + 1, 0
-                if down >= {3: 5, 2: 8, 1: 15}[level]:
+                if down >= {3: 10, 2: 16, 1: 30}[level]:
                     level, down = level - 1, 0
             else:
                 up = down = 0
+            # число тяжёлых потоков считаем только когда память TCP заметна (иначе ss зря грузит процессор)
+            n_act = active
+            if tcpf > 0.25 and now - last_act >= 2:
+                n_act, last_act = heavy_count(), now
+            elif tcpf <= 0.25:
+                n_act = 0
+            if level != old or n_act != active:
+                active = n_act
+                cur_buf = apply_level(level, mem_mb, active, tp)
             if level != old:
-                apply_level(level, mem_mb)
                 log("уровень канала: %s → %s" % (NAMES[old], NAMES[level]),
                     "доступно %.0f%%, PSI some %.1f full %.1f, обмен со свопом %.0f стр/с, свободно свопа %.0f%%" % (avail, some, full, rate, sfree),
                     incident=level >= 2 and old < 2)
 
-            if level >= 2 and now - last_trim > 20:
-                try:
-                    with open("/proc/sys/vm/drop_caches", "w") as f:
-                        f.write("1")
-                except OSError:
-                    pass
-                last_trim = now
-
-            crit_n = crit_n + 1 if level == 3 else 0
-            if crit_n >= 3 and not blocked and now > cool_until and listening() and block():
+            crit_n = crit_n + 1 if (level == 3 and avail < 4 and some > 40) else 0
+            if crit_n >= 10 and not blocked and now > cool_until and listening() and block():
                 blocked, blocked_at, calm = True, now, 0
                 log("память на пределе: новые соединения на 443 временно не принимаются, открытые продолжают работать", incident=True)
             if blocked:
@@ -628,8 +677,8 @@ def main():
                     blocked, calm = False, 0
                     log("приём новых соединений возобновлён" + (" по таймеру (120 с)" if timer else ""))
 
-            hot = hot + 1 if (full > 30 and avail < 4) else 0
-            if hot >= 5:
+            hot = hot + 1 if (full > 50 and avail < 3 and sfree < 10) else 0
+            if hot >= 15:
                 k, total = shed()
                 hot = 0
                 if k:

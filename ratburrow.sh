@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-RB_VERSION="4.20"
+RB_VERSION="4.21"
 NAME="RatBurrow"
 
 set -u
