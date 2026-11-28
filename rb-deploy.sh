@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # RatBurrow: служебные скрипты RELAY и BACKEND (make_scripts: создаются в $TMPD).
 # Часть основного скрипта: подключается из ratburrow.sh (source) и отдельно не запускается.
-RB_PART_VERSION="4.19"
+RB_PART_VERSION="4.20"
 if [ "${BASH_SOURCE[0]}" = "$0" ]; then echo "Это часть RatBurrow, запускайте ratburrow.sh"; exit 1; fi
 
 # ───────────────────────── скрипты установки (создаются в $TMPD) ─────────────────────────
@@ -230,8 +230,9 @@ cat > /usr/local/sbin/chain-memory <<'EOT'
 #   activate  перезапустить x-ui / chain-bridge, если в запущенном процессе остались лимиты прежних версий (GOMEMLIMIT); очистить дисковый своп
 #   diag      собрать данные о памяти (для разбора, кто её занимает)
 # Слои защиты: 1) меньше памяти на соединение в Xray (bufferSize); 2) zram с потолком ОЗУ и большой дисковый своп-запас;
-# 3) ядро раньше начинает освобождать память; 4) chain-memguard: по давлению памяти (PSI) сбрасывает кэш, временно закрывает приём НОВЫХ соединений
-# и при необходимости разрывает самые тяжёлые клиентские соединения, не останавливая Xray
+# 3) ядро раньше начинает освобождать память; 4) chain-memguard — «резиновый» регулятор: по запасу памяти и давлению (PSI) каждые 2 с выбирает уровень
+# (free / normal / tight / crit) и на лету меняет буферы и память TCP: памяти много — канал используется по максимуму, памяти мало — окна плавно сжимаются.
+# Разрыв тяжёлых соединений — только в крайнем случае; Xray не останавливается
 #   remove    убрать всё, что поставил apply
 #   status    показать текущее состояние
 exec </dev/null
@@ -325,7 +326,7 @@ make_swapfile() {  # запас на диске с приоритетом ниж
   echo "своп-файл: $SWAPFILE ${gb} ГБ"
 }
 
-# Xray: размер внутреннего буфера на соединение (по умолчанию 512 КБ в каждую сторону при 1300+ соединениях — сотни МБ) → 64 КБ.
+# Xray: размер внутреннего буфера на соединение (по умолчанию 512 КБ в каждую сторону при 1300+ соединениях — сотни МБ) → 128 КБ (меньше — режет скорость одной загрузки).
 # Значение хранится в шаблоне 3x-ui (policy.levels.0.bufferSize); действует после перезапуска x-ui
 xray_buffer() {
   local db=/etc/x-ui/x-ui.db
@@ -340,16 +341,17 @@ if not row or not row[0]:
 tpl = json.loads(row[0])
 lv = tpl.setdefault("policy", {}).setdefault("levels", {}).setdefault("0", {})
 cur = lv.get("bufferSize")
-if cur is not None and int(cur) <= 64:
+ours = os.path.exists(prev)
+if cur is not None and (int(cur) == 128 or (int(cur) < 128 and not ours)):
     print("Xray: bufferSize уже %s КБ" % cur); sys.exit(0)
 shutil.copy2(db, "%s.bak-buf-%s" % (db, time.strftime("%Y%m%d-%H%M%S")))
-if not os.path.exists(prev):
+if not ours:
     json.dump({"bufferSize": cur}, open(prev, "w"))
-lv["bufferSize"] = 64
+lv["bufferSize"] = 128
 con.execute("update settings set value=? where key='xrayTemplateConfig'", (json.dumps(tpl, ensure_ascii=False),))
 con.commit()
 open("/var/lib/chain-memory.restart", "w").close()
-print("Xray: bufferSize 64 КБ на соединение (было %s), нужен перезапуск x-ui" % ("512 по умолчанию" if cur is None else cur))
+print("Xray: bufferSize 128 КБ на соединение (было %s), нужен перезапуск x-ui" % ("512 по умолчанию" if cur is None else cur))
 EOQ
 }
 
@@ -378,18 +380,20 @@ install_guard() {
   command -v python3 >/dev/null 2>&1 || { echo "chain-memguard: нет python3, пропущено"; return 0; }
   cat > /usr/local/sbin/chain-memguard <<'EOP'
 #!/usr/bin/env python3
-# chain-memguard: защита от «зависания» сервера при нехватке памяти. Процессы не убивает. Ступени:
-#   1. давление растёт: сброс кэша страниц;
-#   2. давление критическое: временно не принимаются НОВЫЕ соединения на порт 443 (кроме BACKEND; уже открытые продолжают работать),
-#      клиенты повторяют попытку сами; правило iptables снимается при спаде давления, не позднее чем через 180 с, и при остановке службы;
-#   3. давление держится: разрываются самые «раздутые» клиентские соединения (клиент переподключится, память вернётся).
-# Давление берётся из PSI (/proc/pressure/memory), MemAvailable и скорости обмена со свопом.
+# chain-memguard: «резиновый» регулятор канала по запасу памяти. Каждые 2 с выбирает уровень и применяет его на лету (без перезапусков):
+#   free      памяти много: буферы и память TCP максимальные, канал используется полностью
+#   normal    обычный режим
+#   tight     запас памяти уменьшается: буферы и память TCP сжимаются, ядро плавно уменьшает окна приёма и отправители замедляются
+#   crit      критично: то же ещё сильнее, сбрасывается кэш; при устойчивой нехватке НОВЫЕ соединения на 443 временно не принимаются (кроме BACKEND)
+# Разрыв самых тяжёлых соединений — только в крайнем случае (память почти исчерпана и ядро не справляется). Процессы не убиваются.
+# Вверх (строже) уровень меняется быстро, вниз (свободнее) только после стабильного спада давления.
 import ctypes, os, re, shlex, shutil, signal, subprocess, sys, time
 
 TAG = "chain-memguard"
 PORT = "443"
 STATE = "/run/chain-memguard.state"
 INTERVAL = 2.0
+NAMES = ("free", "normal", "tight", "crit")
 
 
 def rd(path):
@@ -398,6 +402,14 @@ def rd(path):
             return f.read()
     except OSError:
         return ""
+
+
+def wr(path, val):
+    try:
+        with open("/proc/sys/" + path, "w") as f:
+            f.write(val)
+    except OSError:
+        pass
 
 
 def meminfo():
@@ -447,9 +459,9 @@ def run(args):
         return subprocess.CompletedProcess(args, 1, "", "")
 
 
-def log(title, desc=""):
+def log(title, desc="", incident=False):
     print("%s %s" % (title, desc), flush=True)
-    if os.path.exists("/usr/local/bin/chain-incident"):
+    if incident and os.path.exists("/usr/local/bin/chain-incident"):
         run(["/usr/local/bin/chain-incident", "память", title, desc or title])
 
 
@@ -457,6 +469,42 @@ def listening():
     return bool(run(["ss", "-tlnH", "sport", "=", ":" + PORT]).stdout.strip())
 
 
+# ---------- уровни ----------
+def table(mem_mb):
+    if mem_mb <= 1536:
+        mb = (32, 12, 4, 1)          # МБ на сокет (потолок автонастройки буфера)
+    elif mem_mb <= 3072:
+        mb = (48, 16, 6, 2)
+    else:
+        mb = (64, 32, 8, 2)
+    pct = ((16, 24, 35), (12, 18, 26), (8, 12, 18), (6, 9, 12))   # tcp_mem: нижний / давление / предел, % ОЗУ
+    lowat = (262144, 131072, 65536, 32768)                       # сколько неотправленных данных держит сокет
+    return mb, pct, lowat
+
+
+def apply_level(idx, mem_mb):
+    mb, pct, lowat = table(mem_mb)
+    b = mb[idx] * 1048576
+    pages = mem_mb * 256
+    wr("net/core/rmem_max", str(b))
+    wr("net/core/wmem_max", str(b))
+    wr("net/ipv4/tcp_rmem", "4096 131072 %d" % b)
+    wr("net/ipv4/tcp_wmem", "4096 65536 %d" % b)
+    wr("net/ipv4/tcp_mem", "%d %d %d" % tuple(pages * p // 100 for p in pct[idx]))
+    wr("net/ipv4/tcp_notsent_lowat", str(lowat[idx]))
+
+
+def classify(avail, some, rate, sfree):
+    if some > 25 or avail < 6 or rate > 4000 or (sfree < 12 and (some > 5 or avail < 10)):
+        return 3
+    if some > 8 or avail < 15 or rate > 1000:
+        return 2
+    if some < 2 and avail > 35 and rate < 200:
+        return 0
+    return 1
+
+
+# ---------- приём новых соединений ----------
 def tables():
     return [t for t in ("iptables", "ip6tables") if shutil.which(t)]
 
@@ -507,16 +555,25 @@ def shed(n=3):
 
 
 def main():
+    mem_mb = max(meminfo().get("MemTotal", 1048576) // 1024, 256)
     if "--release" in sys.argv:
         release()
+        apply_level(1, mem_mb)   # при остановке регулятора возвращается обычный режим
         return
     try:
-        ctypes.CDLL(None, use_errno=True).mlockall(3)   # сам сторож не должен уходить в своп
+        ctypes.CDLL(None, use_errno=True).mlockall(3)   # сам регулятор не должен уходить в своп
     except Exception:
         pass
-    signal.signal(signal.SIGTERM, lambda *a: (release(), sys.exit(0)))
+
+    def stop(*a):
+        release()
+        apply_level(1, mem_mb)
+        sys.exit(0)
+    signal.signal(signal.SIGTERM, stop)
     release()
-    blocked, blocked_at, cool_until, calm, hot, last_trim = False, 0.0, 0.0, 0, 0, 0.0
+    level, up, down = 1, 0, 0
+    apply_level(level, mem_mb)
+    blocked, blocked_at, cool_until, crit_n, calm, hot, last_trim = False, 0.0, 0.0, 0, 0, 0, 0.0
     last_io, last_t = swapio(), time.time()
     while True:
         time.sleep(INTERVAL)
@@ -531,36 +588,56 @@ def main():
             io = swapio()
             rate = (io - last_io) / max(now - last_t, 0.1)
             last_io, last_t = io, now
-            crit = some > 25 or avail < 6 or rate > 4000 or (sfree < 12 and (some > 5 or avail < 10))
-            warn = some > 10 or avail < 12 or rate > 1500
-            calm_now = some < 8 and avail > 10 and rate < 500
-            hot = hot + 1 if full > 15 else 0
-            if warn and now - last_trim > 20:
+
+            want = classify(avail, some, rate, sfree)
+            old = level
+            if want > level:
+                up, down = up + 1, 0
+                if up >= (1 if want == 3 else 2):
+                    level, up = want, 0
+            elif want < level:
+                down, up = down + 1, 0
+                if down >= {3: 5, 2: 8, 1: 15}[level]:
+                    level, down = level - 1, 0
+            else:
+                up = down = 0
+            if level != old:
+                apply_level(level, mem_mb)
+                log("уровень канала: %s → %s" % (NAMES[old], NAMES[level]),
+                    "доступно %.0f%%, PSI some %.1f full %.1f, обмен со свопом %.0f стр/с, свободно свопа %.0f%%" % (avail, some, full, rate, sfree),
+                    incident=level >= 2 and old < 2)
+
+            if level >= 2 and now - last_trim > 20:
                 try:
                     with open("/proc/sys/vm/drop_caches", "w") as f:
                         f.write("1")
                 except OSError:
                     pass
                 last_trim = now
-            if crit and not blocked and now > cool_until and listening() and block():
+
+            crit_n = crit_n + 1 if level == 3 else 0
+            if crit_n >= 3 and not blocked and now > cool_until and listening() and block():
                 blocked, blocked_at, calm = True, now, 0
-                log("давление памяти: новые соединения на 443 временно не принимаются",
-                    "доступно %.0f%%, PSI some %.1f full %.1f, обмен со свопом %.0f стр/с, свободно свопа %.0f%%" % (avail, some, full, rate, sfree))
+                log("память на пределе: новые соединения на 443 временно не принимаются, открытые продолжают работать", incident=True)
             if blocked:
-                calm = calm + 1 if calm_now else 0
-                if calm >= 5 or now - blocked_at > 180:
+                calm = calm + 1 if level < 3 else 0
+                if calm >= 3 or now - blocked_at > 120:
+                    timer = calm < 3
                     release()
-                    cool_until = now + (30 if calm < 5 else 0)
-                    blocked = False
-                    log("давление памяти спало: приём новых соединений возобновлён" if calm >= 5 else "приём новых соединений возобновлён по таймеру (180 с)")
-                    calm = 0
-            if hot >= 3:
+                    cool_until = now + (30 if timer else 0)
+                    blocked, calm = False, 0
+                    log("приём новых соединений возобновлён" + (" по таймеру (120 с)" if timer else ""))
+
+            hot = hot + 1 if (full > 30 and avail < 4) else 0
+            if hot >= 5:
                 k, total = shed()
                 hot = 0
                 if k:
-                    log("давление памяти не спадает: разорвано соединений %d из %d тяжёлых" % (k, total))
+                    log("память почти исчерпана: разорвано соединений %d из %d тяжёлых" % (k, total), incident=True)
+
             with open(STATE, "w") as f:
-                f.write("доступно %.0f%%, PSI some %.1f full %.1f, своп-обмен %.0f стр/с, приём новых соединений: %s\n" % (avail, some, full, rate, "ОТКЛЮЧЁН" if blocked else "открыт"))
+                f.write("уровень %s, доступно %.0f%%, PSI some %.1f full %.1f, своп-обмен %.0f стр/с, приём новых соединений: %s\n"
+                        % (NAMES[level], avail, some, full, rate, "ОТКЛЮЧЁН" if blocked else "открыт"))
         except Exception as e:
             print("ошибка цикла: %s" % e, flush=True)
 
@@ -571,7 +648,7 @@ EOP
   chmod 755 /usr/local/sbin/chain-memguard
   cat > /etc/systemd/system/chain-memguard.service <<'EOD2'
 [Unit]
-Description=chain-memguard: защита от зависания при нехватке памяти
+Description=chain-memguard: адаптивный регулятор канала по запасу памяти
 
 [Service]
 ExecStart=/usr/bin/python3 /usr/local/sbin/chain-memguard
@@ -595,7 +672,8 @@ EOD2
 # sysctl: потолок памяти TCP и размеры буферов по объёму ОЗУ. Файл 99-zz грузится после 99-relay-network-tuning.conf и переопределяет его
 write_sysctl() {
   local buf pages sw=30
-  if   [ "$MEM_MB" -le 1536 ]; then buf=8388608     # 8 МБ: при 60 мс RTT хватает на ~1 Гбит/с на соединение
+  # статическая база = уровень normal регулятора chain-memguard (он меняет эти значения на лету и при остановке возвращает их)
+  if   [ "$MEM_MB" -le 1536 ]; then buf=12582912
   elif [ "$MEM_MB" -le 3072 ]; then buf=16777216
   else buf=33554432; fi
   pages=$(( MEM_MB * 256 ))
@@ -606,7 +684,7 @@ write_sysctl() {
     echo "net.core.wmem_max=$buf"
     echo "net.ipv4.tcp_rmem=4096 131072 $buf"
     echo "net.ipv4.tcp_wmem=4096 65536 $buf"
-    [ "$MEM_MB" -le 3072 ] && echo "net.ipv4.tcp_mem=$(( pages * 10 / 100 )) $(( pages * 15 / 100 )) $(( pages * 22 / 100 ))"
+    echo "net.ipv4.tcp_mem=$(( pages * 12 / 100 )) $(( pages * 18 / 100 )) $(( pages * 26 / 100 ))"
     echo "net.ipv4.tcp_notsent_lowat=131072"
     echo "vm.swappiness=$sw"
     echo "vm.watermark_scale_factor=100"   # kswapd начинает освобождать память раньше: меньше остановок в прямой очистке
@@ -732,6 +810,9 @@ do_diag() {
   echo "== cgroup x-ui"; for f in memory.current memory.max memory.high memory.events; do echo "$f: $(tr '\n' ' ' < /sys/fs/cgroup/system.slice/x-ui.service/$f 2>/dev/null)"; done
   echo "== своп / zram"; swapon --show; zramctl 2>/dev/null
   echo "== память сокетов TCP (страницы по 4 КБ)"; grep -E '^(TCP|sockets)' /proc/net/sockstat; sysctl net.ipv4.tcp_mem
+  echo "== регулятор"; cat /run/chain-memguard.state 2>/dev/null; journalctl -u chain-memguard -n 8 --no-pager -o cat 2>/dev/null
+  echo "== чем ограничена скорость соединений на 443 (rwnd_limited — окно приёма, sndbuf_limited — буфер отправки, cwnd_limited — окно перегрузки)"
+  ss -tiHn state established '( sport = :443 )' 2>/dev/null | tr '\n' ' ' | sed 's/ESTAB/\nESTAB/g' | grep -aE 'rwnd_limited|sndbuf_limited|cwnd_limited' | sed -E 's/.*(rwnd_limited:[^ ]*|sndbuf_limited:[^ ]*|cwnd_limited:[^ ]*).*/&/' | cut -c1-230 | head -6
   echo "== ядро: slab (топ)"; slabtop -o -s c 2>/dev/null | sed -n '1,12p'
   echo "== ядро: нехватка памяти, убитые процессы, TCP out of memory"; dmesg -T 2>/dev/null | grep -iE 'out of memory|oom-kill|killed process|tcp: out of memory' | tail -15
   echo "== x-ui: журнал"; journalctl -u x-ui -n 25 --no-pager -o cat 2>/dev/null
