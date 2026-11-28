@@ -10,7 +10,7 @@
 #
 # Совместимость: скрипт работает в bash 3.2 (стандартный bash на macOS), поэтому без ассоциативных массивов.
 
-RT_VERSION="2.1"
+RT_VERSION="2.2"
 set -o pipefail
 
 # ───────────────────────── система ─────────────────────────
@@ -452,12 +452,15 @@ tgt_find() {   # tgt_find имя потери% — вывод по relay / backe
     add "$n не отвечает на ICMP (100% потерь): ping заблокирован или адрес недоступен; ориентируйтесь на mtr и TCP-проверки." \
         "$n does not answer ICMP (100% loss): ping may be blocked or the host is unreachable; rely on mtr and TCP checks."
   elif fgt "$l" 2; then
-    if [ $base_bad -eq 0 ] && [ $gw_bad -eq 0 ]; then
+    if [ $gw_bad -eq 1 ]; then
+      add "Потери ${l}% до $n, но потери есть уже до вашего шлюза: сначала нужно исправить локальный канал клиента, затем перепроверить $n." \
+          "${l}% loss to $n, but there is loss already to your gateway: fix the client's local link first, then re-test $n."
+    elif [ $base_bad -eq 0 ]; then
       add "Потери ${l}% до $n при чистых шлюзе и контрольных адресах: проблема на маршруте до $n или на самом $n (сеть его хостера)." \
           "${l}% loss to $n while the gateway and reference targets are clean: the problem is on the path to $n or on $n itself (its hosting network)."
     else
-      add "Потери ${l}% до $n, но потери есть и до шлюза или контрольных адресов: сначала нужно исправить локальный канал клиента, затем перепроверить $n." \
-          "${l}% loss to $n, but the gateway or reference targets are lossy too: fix the client's local link first, then re-test $n."
+      add "Потери ${l}% до $n; шлюз чистый, локальный канал клиента исправен. Потери есть и до части контрольных адресов (${base_list# }): это может быть общая проблема провайдера, а может быть ICMP-фильтрация на самих адресах; смотрите mtr и повторите тест из другой сети." \
+          "${l}% loss to $n; the gateway is clean, so the client's local link is fine. Some reference targets are lossy too (${base_list# }): this may be an ISP-wide issue or ICMP filtering at those hosts; check mtr and re-test from another network."
     fi
   else
     add "Потерь ICMP ≥2% до $n нет (${l}%)." "No ICMP loss ≥2% to $n (${l}%)."
