@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # RatBurrow: подготовка сервера (run_prepare и помощники sshd).
 # Часть основного скрипта: подключается из ratburrow.sh (source) и отдельно не запускается.
-RB_PART_VERSION="4.14"
+RB_PART_VERSION="4.15"
 if [ "${BASH_SOURCE[0]}" = "$0" ]; then echo "Это часть RatBurrow, запускайте ratburrow.sh"; exit 1; fi
 
 # Убираем противоречащие настройки в drop-in конфигах sshd: Include стоит в начале sshd_config,

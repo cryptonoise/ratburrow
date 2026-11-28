@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # RatBurrow: служебные скрипты RELAY и BACKEND (make_scripts: создаются в $TMPD).
 # Часть основного скрипта: подключается из ratburrow.sh (source) и отдельно не запускается.
-RB_PART_VERSION="4.14"
+RB_PART_VERSION="4.15"
 if [ "${BASH_SOURCE[0]}" = "$0" ]; then echo "Это часть RatBurrow, запускайте ratburrow.sh"; exit 1; fi
 
 # ───────────────────────── скрипты установки (создаются в $TMPD) ─────────────────────────
@@ -866,7 +866,7 @@ def stream(path, ext=None, obfs=False, xmux=False, mode=None):
         # ротация соединений у клиентов (попадает в ссылку подписки через extra).
         # hKeepAlivePeriod: через столько секунд клиент проверяет «зависшее» соединение (+15 с ожидания ответа),
         # то есть это и есть время до восстановления после обрыва: не увеличивать
-        xh["xmux"] = {"maxConnections": 2, "hMaxRequestTimes": "600-900", "hMaxReusableSecs": "1800-3000", "hKeepAlivePeriod": 20}
+        xh["xmux"] = {"maxConnections": int(os.environ.get("XMUX_CONNECTIONS", "2")), "hMaxRequestTimes": "600-900", "hMaxReusableSecs": "1800-3000", "hKeepAlivePeriod": 20}
         xh["scMaxEachPostBytes"] = "1200000-2000000"   # размер POST (серверу нужен лимит не меньше, иначе крупные POST отвергаются)
         xh["scMinPostsIntervalMs"] = "8-14"            # пауза между POST: 30 мс по умолчанию ограничивает отдачу примерно 200 Мбит/с
     s = {"network": "xhttp", "security": "none", "xhttpSettings": xh}

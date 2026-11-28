@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-RB_VERSION="4.14"
+RB_VERSION="4.15"
 NAME="RatBurrow"
 
 set -u
@@ -22,6 +22,11 @@ CHAIN_TUNNEL_PORT=21444   # 127.0.0.1: инбаунд туннеля, к кот�
 SELFTEST_PORT=21481       # 127.0.0.1: временный клиент для проверки цепочки
 XRAY_VER="${XRAY_VER:-26.10.31}"   # закреплённая версия Xray для моста BACKEND (проверена; меняется пунктом меню «Обновить Xray»)
 XUI_VER="${XUI_VER:-v3.11.0}"       # закреплённая версия панели 3x-ui для новой установки
+XMUX_CONNECTIONS="${XMUX_CONNECTIONS:-2}"   # xmux maxConnections пользовательского инбаунда: сколько TCP-соединений клиент держит к RELAY (1-16); задаётся при установке: XMUX_CONNECTIONS=6 bash ratburrow.sh
+XMUX_BAD=""
+case "$XMUX_CONNECTIONS" in ''|*[!0-9]*) XMUX_BAD="$XMUX_CONNECTIONS"; XMUX_CONNECTIONS=2 ;; esac
+if [ "$XMUX_CONNECTIONS" -lt 1 ] || [ "$XMUX_CONNECTIONS" -gt 16 ]; then XMUX_BAD="$XMUX_CONNECTIONS"; XMUX_CONNECTIONS=2; fi
+export XMUX_CONNECTIONS
 TOTAL=12
 STEP=0
 SUB=0; SUBL=""; INFO=""
@@ -1800,6 +1805,7 @@ main() {
 
   preflight
   load_parts
+  [ -z "$XMUX_BAD" ] || warn "XMUX_CONNECTIONS=$XMUX_BAD вне диапазона 1-16: использую 2"
   refresh_marker_status
   show_marks
   startup_checks
