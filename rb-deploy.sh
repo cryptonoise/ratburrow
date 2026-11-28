@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # RatBurrow: служебные скрипты RELAY и BACKEND (make_scripts: создаются в $TMPD).
 # Часть основного скрипта: подключается из ratburrow.sh (source) и отдельно не запускается.
-RB_PART_VERSION="4.17"
+RB_PART_VERSION="4.18"
 if [ "${BASH_SOURCE[0]}" = "$0" ]; then echo "Это часть RatBurrow, запускайте ratburrow.sh"; exit 1; fi
 
 # ───────────────────────── скрипты установки (создаются в $TMPD) ─────────────────────────
@@ -229,6 +229,9 @@ cat > /usr/local/sbin/chain-memory <<'EOT'
 #   apply     записать настройки: sysctl, zram/своп, защита служб от OOM, снятие лимитов 4.16 (службы не перезапускаются)
 #   activate  перезапустить x-ui / chain-bridge, если в запущенном процессе остались лимиты прежних версий (GOMEMLIMIT); очистить дисковый своп
 #   diag      собрать данные о памяти (для разбора, кто её занимает)
+# Слои защиты: 1) меньше памяти на соединение в Xray (bufferSize); 2) zram с потолком ОЗУ и большой дисковый своп-запас;
+# 3) ядро раньше начинает освобождать память; 4) chain-memguard: по давлению памяти (PSI) сбрасывает кэш, временно закрывает приём НОВЫХ соединений
+# и при необходимости разрывает самые тяжёлые клиентские соединения, не останавливая Xray
 #   remove    убрать всё, что поставил apply
 #   status    показать текущее состояние
 exec </dev/null
@@ -242,17 +245,29 @@ MEM_MB=$(awk '/^MemTotal:/ { printf "%d", $2 / 1024 }' /proc/meminfo)
 unit_exists() { systemctl cat "$1.service" >/dev/null 2>&1; }
 zram_active() { swapon --show=NAME --noheadings 2>/dev/null | grep -q '^/dev/zram'; }
 
-# своп: zram (сжатая подкачка в ОЗУ); если ядро без zram и подкачки нет совсем — файл 1 ГБ
+# своп: zram (быстрый, но с потолком ОЗУ: видео и шифрованный трафик не сжимаются и хранились бы как есть) + дисковый файл-запас
 setup_swap() {
-  local total avail
   if ! zram_active && modprobe zram 2>/dev/null && command -v zramctl >/dev/null 2>&1; then
-    cat > /usr/local/sbin/chain-zram <<'EOZ'
+    write_zram_files
+    systemctl daemon-reload
+    systemctl enable chain-zram.service >/dev/null 2>&1 || true
+    systemctl restart chain-zram.service >/dev/null 2>&1 || true
+  elif [ -f /etc/systemd/system/chain-zram.service ]; then
+    write_zram_files; systemctl daemon-reload   # обновить скрипт для следующей загрузки
+  fi
+  if zram_active; then zram_limit; echo "своп: zram включён"; else echo "своп: zram недоступен в этом ядре"; fi
+  make_swapfile
+}
+
+write_zram_files() {
+  cat > /usr/local/sbin/chain-zram <<'EOZ'
 #!/bin/bash
-# zram-своп: размер — половина ОЗУ (не более 2 ГБ); данные сжимаются, реально занимают в 2–3 раза меньше
+# zram-своп: размер равен ОЗУ (не более 2 ГБ), потолок занимаемой ОЗУ — 25%; сверх потолка страницы уходят в дисковый своп
 case "${1:-start}" in
   start)
     modprobe zram || exit 1
-    mb=$(awk '/^MemTotal:/ { m = int($2 / 2048); if (m > 2048) m = 2048; print m }' /proc/meminfo)
+    mb=$(awk '/^MemTotal:/ { m = int($2 / 1024); if (m > 2048) m = 2048; print m }' /proc/meminfo)
+    lim=$(awk '/^MemTotal:/ { print int($2 / 4096) }' /proc/meminfo)
     dev=""
     for alg in zstd lz4 lzo-rle ""; do
       if [ -n "$alg" ]; then dev=$(zramctl --find --size "${mb}M" --algorithm "$alg" 2>/dev/null) || dev=""
@@ -260,6 +275,7 @@ case "${1:-start}" in
       [ -n "$dev" ] && break
     done
     [ -n "$dev" ] || exit 1
+    echo "${lim}M" > "/sys/block/${dev#/dev/}/mem_limit" 2>/dev/null || true
     mkswap "$dev" >/dev/null && swapon -p 100 "$dev"
     ;;
   stop)
@@ -267,8 +283,8 @@ case "${1:-start}" in
     ;;
 esac
 EOZ
-    chmod 755 /usr/local/sbin/chain-zram
-    cat > /etc/systemd/system/chain-zram.service <<'EOZ'
+  chmod 755 /usr/local/sbin/chain-zram
+  cat > /etc/systemd/system/chain-zram.service <<'EOZ'
 [Unit]
 Description=zram swap (chain-memory)
 
@@ -281,22 +297,299 @@ ExecStop=/usr/local/sbin/chain-zram stop
 [Install]
 WantedBy=multi-user.target
 EOZ
-    systemctl daemon-reload
-    systemctl enable chain-zram.service >/dev/null 2>&1 || true
-    systemctl restart chain-zram.service >/dev/null 2>&1 || true
+}
+
+zram_limit() {  # потолок ОЗУ для уже работающего zram (применяется сразу, без перезагрузки)
+  local z lim=$(( MEM_MB * 25 / 100 ))
+  for z in /sys/block/zram*; do
+    [ -w "$z/mem_limit" ] || continue
+    echo "${lim}M" > "$z/mem_limit" 2>/dev/null && echo "zram: потолок ОЗУ ${lim} МБ ($(basename "$z"))"
+  done
+}
+
+make_swapfile() {  # запас на диске с приоритетом ниже zram: 4 ГБ при ≥ 7 ГБ свободного места, 2 ГБ при ≥ 5 ГБ
+  local avail gb
+  if [ -e "$SWAPFILE" ]; then
+    swapon --show=NAME --noheadings 2>/dev/null | grep -qx "$SWAPFILE" || swapon -p 10 "$SWAPFILE" 2>/dev/null || true
+    echo "своп-файл: $SWAPFILE уже есть"; return 0
   fi
-  if zram_active; then echo "своп: zram включён"; return 0; fi
-  total=$(awk '/^SwapTotal:/ { print int($2 / 1024) }' /proc/meminfo)
-  if [ "${total:-0}" -ge 256 ]; then echo "своп: уже есть (${total} МБ), zram недоступен"; return 0; fi
   avail=$(df -Pm / | awk 'NR == 2 { print $4 }')
-  if [ "${avail:-0}" -ge 4096 ] && [ ! -e "$SWAPFILE" ]; then
-    { fallocate -l 1G "$SWAPFILE" 2>/dev/null || dd if=/dev/zero of="$SWAPFILE" bs=1M count=1024 status=none; } \
-      && chmod 600 "$SWAPFILE" && mkswap "$SWAPFILE" >/dev/null && swapon -p 10 "$SWAPFILE" \
-      && { grep -q "^$SWAPFILE " /etc/fstab || echo "$SWAPFILE none swap sw,pri=10 0 0" >> /etc/fstab; echo "своп: файл $SWAPFILE 1 ГБ"; } \
-      || { swapoff "$SWAPFILE" 2>/dev/null; rm -f "$SWAPFILE"; echo "своп: создать не удалось (контейнер без поддержки подкачки?)"; }
-  else
-    echo "своп: не создан (мало места на диске или файл уже есть)"
-  fi
+  if   [ "${avail:-0}" -ge 7168 ]; then gb=4
+  elif [ "${avail:-0}" -ge 5120 ]; then gb=2
+  else echo "своп-файл: не создан (свободно ${avail:-0} МБ)"; return 0; fi
+  fallocate -l "${gb}G" "$SWAPFILE" 2>/dev/null && chmod 600 "$SWAPFILE" && mkswap "$SWAPFILE" >/dev/null 2>&1 && swapon -p 10 "$SWAPFILE" 2>/dev/null \
+    || { swapoff "$SWAPFILE" 2>/dev/null; rm -f "$SWAPFILE"
+         dd if=/dev/zero of="$SWAPFILE" bs=1M count=$(( gb * 1024 )) status=none 2>/dev/null && chmod 600 "$SWAPFILE" && mkswap "$SWAPFILE" >/dev/null 2>&1 && swapon -p 10 "$SWAPFILE" 2>/dev/null; } \
+    || { swapoff "$SWAPFILE" 2>/dev/null; rm -f "$SWAPFILE"; echo "своп-файл: создать не удалось (контейнер без поддержки подкачки?)"; return 0; }
+  grep -q "^$SWAPFILE " /etc/fstab || echo "$SWAPFILE none swap sw,pri=10 0 0" >> /etc/fstab
+  echo "своп-файл: $SWAPFILE ${gb} ГБ"
+}
+
+# Xray: размер внутреннего буфера на соединение (по умолчанию 512 КБ в каждую сторону при 1300+ соединениях — сотни МБ) → 64 КБ.
+# Значение хранится в шаблоне 3x-ui (policy.levels.0.bufferSize); действует после перезапуска x-ui
+xray_buffer() {
+  local db=/etc/x-ui/x-ui.db
+  [ -f "$db" ] && command -v python3 >/dev/null 2>&1 || return 0
+  python3 - "$db" <<'EOQ'
+import json, os, shutil, sqlite3, sys, time
+db, prev = sys.argv[1], "/var/lib/chain-memory.prev"
+con = sqlite3.connect(db, timeout=30)
+row = con.execute("select value from settings where key='xrayTemplateConfig'").fetchone()
+if not row or not row[0]:
+    print("шаблон Xray не задан: bufferSize не меняется"); sys.exit(0)
+tpl = json.loads(row[0])
+lv = tpl.setdefault("policy", {}).setdefault("levels", {}).setdefault("0", {})
+cur = lv.get("bufferSize")
+if cur is not None and int(cur) <= 64:
+    print("Xray: bufferSize уже %s КБ" % cur); sys.exit(0)
+shutil.copy2(db, "%s.bak-buf-%s" % (db, time.strftime("%Y%m%d-%H%M%S")))
+if not os.path.exists(prev):
+    json.dump({"bufferSize": cur}, open(prev, "w"))
+lv["bufferSize"] = 64
+con.execute("update settings set value=? where key='xrayTemplateConfig'", (json.dumps(tpl, ensure_ascii=False),))
+con.commit()
+open("/var/lib/chain-memory.restart", "w").close()
+print("Xray: bufferSize 64 КБ на соединение (было %s), нужен перезапуск x-ui" % ("512 по умолчанию" if cur is None else cur))
+EOQ
+}
+
+xray_buffer_revert() {
+  local db=/etc/x-ui/x-ui.db
+  [ -f "$db" ] && [ -f /var/lib/chain-memory.prev ] && command -v python3 >/dev/null 2>&1 || return 0
+  python3 - "$db" <<'EOQ'
+import json, os, sqlite3, sys
+db, prev = sys.argv[1], "/var/lib/chain-memory.prev"
+old = json.load(open(prev)).get("bufferSize")
+con = sqlite3.connect(db, timeout=30)
+row = con.execute("select value from settings where key='xrayTemplateConfig'").fetchone()
+if row and row[0]:
+    tpl = json.loads(row[0])
+    lv = tpl.setdefault("policy", {}).setdefault("levels", {}).setdefault("0", {})
+    if old is None: lv.pop("bufferSize", None)
+    else: lv["bufferSize"] = old
+    con.execute("update settings set value=? where key='xrayTemplateConfig'", (json.dumps(tpl, ensure_ascii=False),))
+    con.commit()
+os.remove(prev)
+EOQ
+}
+
+# сторож давления памяти (chain-memguard)
+install_guard() {
+  command -v python3 >/dev/null 2>&1 || { echo "chain-memguard: нет python3, пропущено"; return 0; }
+  cat > /usr/local/sbin/chain-memguard <<'EOP'
+#!/usr/bin/env python3
+# chain-memguard: защита от «зависания» сервера при нехватке памяти. Процессы не убивает. Ступени:
+#   1. давление растёт: сброс кэша страниц;
+#   2. давление критическое: временно не принимаются НОВЫЕ соединения на порт 443 (кроме BACKEND; уже открытые продолжают работать),
+#      клиенты повторяют попытку сами; правило iptables снимается при спаде давления, не позднее чем через 180 с, и при остановке службы;
+#   3. давление держится: разрываются самые «раздутые» клиентские соединения (клиент переподключится, память вернётся).
+# Давление берётся из PSI (/proc/pressure/memory), MemAvailable и скорости обмена со свопом.
+import ctypes, os, re, shlex, shutil, signal, subprocess, sys, time
+
+TAG = "chain-memguard"
+PORT = "443"
+STATE = "/run/chain-memguard.state"
+INTERVAL = 2.0
+
+
+def rd(path):
+    try:
+        with open(path) as f:
+            return f.read()
+    except OSError:
+        return ""
+
+
+def meminfo():
+    d = {}
+    for line in rd("/proc/meminfo").splitlines():
+        k, _, v = line.partition(":")
+        try:
+            d[k] = int(v.split()[0])
+        except (ValueError, IndexError):
+            pass
+    return d
+
+
+def psi():
+    some = full = 0.0
+    for line in rd("/proc/pressure/memory").splitlines():
+        m = re.match(r"(some|full) avg10=([0-9.]+)", line)
+        if m:
+            if m.group(1) == "some":
+                some = float(m.group(2))
+            else:
+                full = float(m.group(2))
+    return some, full
+
+
+def swapio():
+    n = 0
+    for line in rd("/proc/vmstat").splitlines():
+        if line.startswith(("pswpin ", "pswpout ")):
+            n += int(line.split()[1])
+    return n
+
+
+def backend_ips():
+    ips = []
+    for line in rd("/etc/nginx/chain-backend.conf").splitlines():
+        m = re.match(r"\s*allow\s+([0-9a-fA-F:.]+)\s*;", line)
+        if m and m.group(1) not in ("127.0.0.1", "::1"):
+            ips.append(m.group(1))
+    return ips
+
+
+def run(args):
+    try:
+        return subprocess.run(args, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, timeout=20)
+    except Exception:
+        return subprocess.CompletedProcess(args, 1, "", "")
+
+
+def log(title, desc=""):
+    print("%s %s" % (title, desc), flush=True)
+    if os.path.exists("/usr/local/bin/chain-incident"):
+        run(["/usr/local/bin/chain-incident", "память", title, desc or title])
+
+
+def listening():
+    return bool(run(["ss", "-tlnH", "sport", "=", ":" + PORT]).stdout.strip())
+
+
+def tables():
+    return [t for t in ("iptables", "ip6tables") if shutil.which(t)]
+
+
+def block():
+    ips, ok = backend_ips(), False
+    for t in tables():
+        mine = [ip for ip in ips if (":" in ip) == (t == "ip6tables")]
+        base = ["-p", "tcp", "--dport", PORT, "-m", "comment", "--comment", TAG]
+        if run([t, "-w", "-I", "INPUT", "1"] + base + ["--syn", "-j", "REJECT", "--reject-with", "tcp-reset"]).returncode == 0:
+            ok = True
+        for ip in mine:
+            run([t, "-w", "-I", "INPUT", "1", "-s", ip] + base + ["-j", "ACCEPT"])
+    return ok
+
+
+def release():
+    for t in tables():
+        for line in run([t, "-w", "-S", "INPUT"]).stdout.splitlines():
+            if TAG in line and line.startswith("-A INPUT"):
+                run([t, "-w", "-D", "INPUT"] + shlex.split(line)[2:])
+
+
+def shed(n=3):
+    skip = set(backend_ips())
+    rows = []
+    for line in run(["ss", "-tnH", "state", "established", "sport", "=", ":" + PORT]).stdout.splitlines():
+        f = line.split()
+        if f and not f[0].isdigit():
+            f = f[1:]
+        if len(f) < 4:
+            continue
+        try:
+            q = int(f[0]) + int(f[1])
+        except ValueError:
+            continue
+        ip, _, port = f[3].rpartition(":")
+        ip = ip.strip("[]")
+        if ip in skip or ip.startswith("127.") or ip == "::1" or q < 262144:
+            continue
+        rows.append((q, ip, port))
+    rows.sort(reverse=True)
+    killed = 0
+    for q, ip, port in rows[:n]:
+        if run(["ss", "-K", "-tn", "dst", ip, "dport", "=", ":" + port, "sport", "=", ":" + PORT]).returncode == 0:
+            killed += 1
+    return killed, len(rows)
+
+
+def main():
+    if "--release" in sys.argv:
+        release()
+        return
+    try:
+        ctypes.CDLL(None, use_errno=True).mlockall(3)   # сам сторож не должен уходить в своп
+    except Exception:
+        pass
+    signal.signal(signal.SIGTERM, lambda *a: (release(), sys.exit(0)))
+    release()
+    blocked, blocked_at, cool_until, calm, hot, last_trim = False, 0.0, 0.0, 0, 0, 0.0
+    last_io, last_t = swapio(), time.time()
+    while True:
+        time.sleep(INTERVAL)
+        try:
+            now = time.time()
+            mi = meminfo()
+            tot = max(mi.get("MemTotal", 1), 1)
+            avail = mi.get("MemAvailable", 0) * 100.0 / tot
+            st = mi.get("SwapTotal", 0)
+            sfree = mi.get("SwapFree", 0) * 100.0 / st if st else 100.0
+            some, full = psi()
+            io = swapio()
+            rate = (io - last_io) / max(now - last_t, 0.1)
+            last_io, last_t = io, now
+            crit = some > 25 or avail < 6 or rate > 4000 or (sfree < 12 and (some > 5 or avail < 10))
+            warn = some > 10 or avail < 12 or rate > 1500
+            calm_now = some < 8 and avail > 10 and rate < 500
+            hot = hot + 1 if full > 15 else 0
+            if warn and now - last_trim > 20:
+                try:
+                    with open("/proc/sys/vm/drop_caches", "w") as f:
+                        f.write("1")
+                except OSError:
+                    pass
+                last_trim = now
+            if crit and not blocked and now > cool_until and listening() and block():
+                blocked, blocked_at, calm = True, now, 0
+                log("давление памяти: новые соединения на 443 временно не принимаются",
+                    "доступно %.0f%%, PSI some %.1f full %.1f, обмен со свопом %.0f стр/с, свободно свопа %.0f%%" % (avail, some, full, rate, sfree))
+            if blocked:
+                calm = calm + 1 if calm_now else 0
+                if calm >= 5 or now - blocked_at > 180:
+                    release()
+                    cool_until = now + (30 if calm < 5 else 0)
+                    blocked = False
+                    log("давление памяти спало: приём новых соединений возобновлён" if calm >= 5 else "приём новых соединений возобновлён по таймеру (180 с)")
+                    calm = 0
+            if hot >= 3:
+                k, total = shed()
+                hot = 0
+                if k:
+                    log("давление памяти не спадает: разорвано соединений %d из %d тяжёлых" % (k, total))
+            with open(STATE, "w") as f:
+                f.write("доступно %.0f%%, PSI some %.1f full %.1f, своп-обмен %.0f стр/с, приём новых соединений: %s\n" % (avail, some, full, rate, "ОТКЛЮЧЁН" if blocked else "открыт"))
+        except Exception as e:
+            print("ошибка цикла: %s" % e, flush=True)
+
+
+if __name__ == "__main__":
+    main()
+EOP
+  chmod 755 /usr/local/sbin/chain-memguard
+  cat > /etc/systemd/system/chain-memguard.service <<'EOD2'
+[Unit]
+Description=chain-memguard: защита от зависания при нехватке памяти
+
+[Service]
+ExecStart=/usr/bin/python3 /usr/local/sbin/chain-memguard
+ExecStopPost=/usr/local/sbin/chain-memguard --release
+Restart=always
+RestartSec=3
+OOMScoreAdjust=-900
+Nice=-10
+LimitMEMLOCK=infinity
+
+[Install]
+WantedBy=multi-user.target
+EOD2
+  systemctl daemon-reload
+  systemctl enable chain-memguard.service >/dev/null 2>&1 || true
+  systemctl restart chain-memguard.service >/dev/null 2>&1 || true
+  sleep 1
+  systemctl is-active --quiet chain-memguard && echo "chain-memguard: работает" || echo "chain-memguard: не запустился"
 }
 
 # sysctl: потолок памяти TCP и размеры буферов по объёму ОЗУ. Файл 99-zz грузится после 99-relay-network-tuning.conf и переопределяет его
@@ -316,6 +609,8 @@ write_sysctl() {
     [ "$MEM_MB" -le 3072 ] && echo "net.ipv4.tcp_mem=$(( pages * 10 / 100 )) $(( pages * 15 / 100 )) $(( pages * 22 / 100 ))"
     echo "net.ipv4.tcp_notsent_lowat=131072"
     echo "vm.swappiness=$sw"
+    echo "vm.watermark_scale_factor=100"   # kswapd начинает освобождать память раньше: меньше остановок в прямой очистке
+    echo "vm.watermark_boost_factor=0"
     zram_active && echo "vm.page-cluster=0"
     [ "$MEM_MB" -le 3072 ] && echo "vm.min_free_kbytes=32768"
   } > "$CONF"
@@ -391,10 +686,10 @@ do_activate() {
   for u in $UNITS; do
     unit_exists "$u" && [ -f "/etc/systemd/system/$u.service.d/chain-memory.conf" ] || continue
     systemctl is-active --quiet "$u" || continue
-    stale_limit "$u" || continue
+    if [ "$u" = x-ui ] && [ -f /var/lib/chain-memory.restart ]; then rm -f /var/lib/chain-memory.restart; else stale_limit "$u" || continue; fi
     systemctl restart "$u"
     for i in $(seq 1 20); do systemctl is-active --quiet "$u" && break; sleep 2; done
-    systemctl is-active --quiet "$u" && echo "перезапущен: $u (старые лимиты памяти сняты)" || echo "ВНИМАНИЕ: $u не запустился после перезапуска" >&2
+    systemctl is-active --quiet "$u" && echo "перезапущен: $u (новые параметры памяти применены)" || echo "ВНИМАНИЕ: $u не запустился после перезапуска" >&2
   done
   reclaim_swap
 }
@@ -405,6 +700,10 @@ do_remove() {
     rm -f "/etc/systemd/system/$u.service.d/chain-memory.conf"
     rmdir "/etc/systemd/system/$u.service.d" 2>/dev/null || true
   done
+  systemctl disable --now chain-memguard.service >/dev/null 2>&1 || true
+  [ -x /usr/local/sbin/chain-memguard ] && /usr/local/sbin/chain-memguard --release
+  rm -f /etc/systemd/system/chain-memguard.service /usr/local/sbin/chain-memguard /run/chain-memguard.state /var/lib/chain-memory.restart
+  xray_buffer_revert
   rm -f "$CONF" /etc/systemd/system/earlyoom.service.d/chain.conf
   rmdir /etc/systemd/system/earlyoom.service.d 2>/dev/null || true
   systemctl disable --now chain-zram.service >/dev/null 2>&1 || true
@@ -447,13 +746,14 @@ do_status() {
   for u in $UNITS; do
     unit_exists "$u" && echo "$u: $(stale_limit "$u" && echo "работает со старым GOMEMLIMIT (нужно: chain-memory activate)" || echo "ок")"
   done
+  echo "сторож: $(systemctl is-active chain-memguard 2>/dev/null); $(cat /run/chain-memguard.state 2>/dev/null)"
   echo "cgroup x-ui: $(cat /sys/fs/cgroup/system.slice/x-ui.service/memory.current 2>/dev/null) байт, max=$(cat /sys/fs/cgroup/system.slice/x-ui.service/memory.max 2>/dev/null)"
 }
 
 [ "$#" -gt 0 ] || set -- status
 for a in "$@"; do
   case "$a" in
-    apply)    setup_swap; write_sysctl; write_limits; remove_earlyoom ;;
+    apply)    setup_swap; write_sysctl; write_limits; remove_earlyoom; xray_buffer; install_guard ;;
     activate) do_activate ;;
     remove)   do_remove ;;
     status)   do_status ;;
