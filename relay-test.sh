@@ -2,7 +2,7 @@
 # relay-test.sh — диагностика задержек, потерь пакетов и состояния сети. Запускается на КЛИЕНТЕ (macOS или Linux).
 #
 # Что делает: спрашивает IP relay (обязательно) и IP backend (если нужен), затем с клиента меряет пинг и потери
-# до своего шлюза, контрольных адресов (Cloudflare, Google, Яндекс), relay и backend, строит маршруты (mtr),
+# до своего шлюза, контрольных адресов (Google, Яндекс), relay и backend, строит маршруты (mtr),
 # проверяет MTU пути, время TCP/TLS-соединений и сравнивает счётчики сетевой карты и TCP до/после теста.
 # Каждая команда показана в отчёте вместе с выводом. Отчёт выводится только в консоль, файл не создаётся.
 #
@@ -288,12 +288,12 @@ echo
 
 # ───────────────────────── подготовка ─────────────────────────
 if [ $IS_MAC -eq 1 ]; then
-  DEV=$(route -n get 1.1.1.1 2>/dev/null | awk '/interface:/ { print $2; exit }')
+  DEV=$(route -n get 77.88.8.8 2>/dev/null | awk '/interface:/ { print $2; exit }')
   GW=$(route -n get default 2>/dev/null | awk '/gateway:/ { print $2; exit }')
   LOCAL_IP=$([ -n "$DEV" ] && ifconfig "$DEV" 2>/dev/null | awk '$1 == "inet" { print $2; exit }')
 else
-  DEV=$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for (i = 1; i < NF; i++) if ($i == "dev") { print $(i + 1); exit }}')
-  LOCAL_IP=$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for (i = 1; i < NF; i++) if ($i == "src") { print $(i + 1); exit }}')
+  DEV=$(ip -4 route get 77.88.8.8 2>/dev/null | awk '{for (i = 1; i < NF; i++) if ($i == "dev") { print $(i + 1); exit }}')
+  LOCAL_IP=$(ip -4 route get 77.88.8.8 2>/dev/null | awk '{for (i = 1; i < NF; i++) if ($i == "src") { print $(i + 1); exit }}')
   GW=$(ip -4 route show default 2>/dev/null | awk '{for (i = 1; i < NF; i++) if ($i == "via") { print $(i + 1); exit }}')
 fi
 if [ -z "$DEV" ]; then echo "не удалось определить сетевой интерфейс (нет маршрута по умолчанию?)"; exit 1; fi
@@ -357,7 +357,6 @@ fi
 section "2. Задержки и потери (ICMP, ${COUNT} пакетов на цель)"
 emit "  ${D}Важно: потери ICMP не всегда равны потерям TCP, но потери на шлюзе или у контрольных адресов объясняют просадки скорости.${R}"
 [ -n "$GW" ] && ping_target "gateway" "$GW"
-ping_target "cloudflare" "1.1.1.1"
 ping_target "google" "8.8.8.8"
 ping_target "yandex" "77.88.8.8"
 ping_target "relay" "$RELAY_IP"
@@ -370,7 +369,7 @@ mtu_target() {   # mtu_target имя адрес
   run "MTU до $1 ($2)" "f_mtu $2" "ping $PING_DF -s <размер> $2 (двоичный поиск)"
   MTU_NAME+=("$1"); MTU_VAL+=("$(sed -n 's/.*MTU пути = \([0-9]*\).*/\1/p' "$RT_OUT")")
 }
-mtu_target "cloudflare" "1.1.1.1"
+mtu_target "yandex" "77.88.8.8"
 mtu_target "relay" "$RELAY_IP"
 [ -n "$BACKEND_IP" ] && mtu_target "backend" "$BACKEND_IP"
 
@@ -380,8 +379,8 @@ emit "  ${D}Хоп, на котором потери ≥2% не исчезают
 if have mtr; then
   mtr_target "relay" "$RELAY_IP"
   [ -n "$BACKEND_IP" ] && mtr_target "backend" "$BACKEND_IP"
-  mtr_target "cloudflare" "1.1.1.1"
   mtr_target "yandex" "77.88.8.8"
+  mtr_target "google" "8.8.8.8"
 else
   emit "  ${YLW}▲${R} mtr не установлен: раздел пропущен"
 fi
@@ -389,8 +388,8 @@ fi
 # ───────────────────────── 5. TCP/HTTPS ─────────────────────────
 section "5. Время TCP- и TLS-соединений (5 запросов)"
 if have curl; then
-  run "Cloudflare: dns / tcp / tls / первый байт" "f_curl https://www.cloudflare.com/cdn-cgi/trace" "curl -4 -w '…' https://www.cloudflare.com/cdn-cgi/trace  (×5)"
-  run "Яндекс" "f_curl https://ya.ru" "curl -4 -w '…' https://ya.ru  (×5)"
+  run "Яндекс: dns / tcp / tls / первый байт" "f_curl https://ya.ru" "curl -4 -w '…' https://ya.ru  (×5)"
+  run "Google" "f_curl https://www.google.com/generate_204" "curl -4 -w '…' https://www.google.com/generate_204  (×5)"
   run "GitHub (нужен установщику)" "f_curl https://raw.githubusercontent.com/cryptonoise/ratburrow/refs/heads/main/README.md" "curl -4 -w '…' https://raw.githubusercontent.com/…  (×5)"
 else
   emit "  ${YLW}▲${R} curl не установлен: раздел пропущен"
@@ -424,7 +423,7 @@ for i in "${!P_NAME[@]}"; do
   n=${P_NAME[$i]}; l=${P_LOSS[$i]}
   case "$n" in
     gateway) gw_loss=$l ;;
-    cloudflare|google|yandex)
+    google|yandex)
       if num_ok "$l" && ! fgt "$l" 99; then
         base_n=$((base_n + 1))
         if fgt "$l" 2; then base_bad=$((base_bad + 1)); base_list+=" $n=${l}%"; fi
@@ -442,8 +441,8 @@ if [ $base_bad -gt 0 ] && [ $gw_bad -eq 0 ]; then
       "The gateway answers without loss, but reference targets show loss ≥2%:${base_list}. The cause is beyond the gateway: ISP backbone or peering."
 fi
 if [ $base_n -gt 0 ] && [ $base_bad -eq 0 ] && [ $gw_bad -eq 0 ]; then
-  add "Потерь ICMP ≥2% до контрольных адресов (Cloudflare, Google, Яндекс) нет: интернет-канал клиента в целом исправен." \
-      "No ICMP loss ≥2% to the reference targets (Cloudflare, Google, Yandex): the client's internet connection looks healthy."
+  add "Потерь ICMP ≥2% до контрольных адресов (Google, Яндекс) нет: интернет-канал клиента в целом исправен." \
+      "No ICMP loss ≥2% to the reference targets (Google, Yandex): the client's internet connection looks healthy."
 fi
 
 tgt_find() {   # tgt_find имя потери% — вывод по relay / backend
