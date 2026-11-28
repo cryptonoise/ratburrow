@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-RB_VERSION="4.22"
+RB_VERSION="4.23"
 NAME="RatBurrow"
 
 set -u
@@ -174,7 +174,7 @@ step_logline() {  # step_logline СМЕЩЕНИЕ_ЛОГА
   sz=$(stat -c %s "$LOG" 2>/dev/null || echo 0)
   [ "$sz" -gt "$1" ] || return 0
   tail -c 4096 "$LOG" 2>/dev/null | tr '\r\000' '\n\n' | sed 's/\x1b\[[0-9;]*[A-Za-z]//g' \
-    | tr -d '\001-\010\013\014\016-\037\177' | grep -a -v '^[[:space:]]*$' | tail -n1 \
+    | grep -v '^[[:space:]]*$' | tail -n1 \
     | sed -E 's/Waiting for cache lock: Could not get lock ([^ ]+)\. It is held by process ([0-9]+) \(([^)]*)\).*/Ожидание блокировки apt — её держит процесс \2 (\3)/'
 }
 
@@ -193,45 +193,22 @@ step_info() {  # step_info PID ФАЙЛ_СТАТУСА СМЕЩЕНИЕ_ЛОГА
   if [ "$idle" -ge 30 ]; then INFO="${INFO:+$INFO · }нет новых сообщений ${idle}с, процесс выполняется"; fi
 }
 
-# ширина терминала. tput cols внутри $(...) видит не терминал, а канал, и возвращает 80, поэтому спрашиваем сам терминал
-term_cols() {
-  local c
-  c=$(stty size </dev/tty 2>/dev/null | awk '{ print $2 }')
-  case "$c" in ''|*[!0-9]*|0) c=$(stty size <&2 2>/dev/null | awk '{ print $2 }') ;; esac
-  case "$c" in ''|*[!0-9]*|0) c=${COLUMNS:-} ;; esac
-  case "$c" in ''|*[!0-9]*|0) c=$(tput cols 2>/dev/null) ;; esac
-  case "$c" in ''|*[!0-9]*|0) c=80 ;; esac
-  echo "$c"
-}
-trunc() {  # trunc СТРОКА ДЛИНА: если не помещается, в конце многоточие
-  local s=$1 n=$2
-  [ "$n" -lt 10 ] && n=10
-  if [ "${#s}" -gt "$n" ]; then s="${s:0:$((n - 1))}…"; fi
-  printf '%s' "$s"
-}
-
 # ───────────────────────── выполнение шагов с анимацией ─────────────────────────
 # Строка 1: спиннер + название + время. Строка 2: что происходит прямо сейчас
 # (прогресс apt, текущий пакет, активный процесс, ожидание блокировки).
 # Без терминала (лог/pipe) раз в минуту печатается строка-«пульс».
-step_run() {  # step_run [-s] [-q] "Описание" команда args...   (-s: при ошибке только предупреждение; -q: одна строка без «что происходит сейчас»)
-  local soft=0 quiet=0
-  while [ "${1:-}" = "-s" ] || [ "${1:-}" = "-q" ]; do
-    if [ "$1" = "-s" ]; then soft=1; else quiet=1; fi
-    shift
-  done
+step_run() {  # step_run [-s] "Описание" команда args...   (-s: при ошибке только предупреждение)
+  local soft=0
+  if [ "${1:-}" = "-s" ]; then soft=1; shift; fi
   local label="$1"
   shift
-  local t0=$SECONDS pid rc i=0 clr="" tty=0 sf off cols lab infotxt=""
+  local t0=$SECONDS pid rc i=0 clr="" tty=0 sf off cols lab
   local lastsig="" lastchg=$SECONDS proc="" tick=0
-  if [ -t 1 ]; then
-    tty=1
-    if [ $quiet -eq 1 ]; then clr=$'\r\033[2K'; else clr=$'\r\033[2K\n\033[2K\033[A\r'; fi
-  fi
+  if [ -t 1 ]; then tty=1; clr=$'\r\033[2K\n\033[2K\033[A\r'; fi
   sf=$(mktemp 2>/dev/null) || sf=/dev/null
   off=$(stat -c %s "$LOG" 2>/dev/null || echo 0)
-  cols=$(term_cols)
-  lab=$(trunc "$label" $((cols - 14)))
+  cols=$(tput cols 2>/dev/null || echo 80)
+  lab=${label:0:$((cols - 14))}
   ( export STEP_STATUS_FILE="$sf"; "$@" ) </dev/null >>"$LOG" 2>&1 &
   pid=$!
   if [ $tty -eq 1 ]; then
@@ -239,17 +216,10 @@ step_run() {  # step_run [-s] [-q] "Описание" команда args...   (
       if [ $((i % 10)) -eq 0 ]; then
         step_info "$pid" "$sf" "$off"
         tick=$((tick + 1))
-        cols=$(term_cols)   # окно можно растянуть во время установки
-        lab=$(trunc "$label" $((cols - 14)))
-        infotxt=$(trunc "$INFO" $((cols - 8)))
       fi
-      if [ $quiet -eq 1 ]; then
-        printf '\r  %s%s%s %s %s(%ds)%s\033[K' "$CYN" "${SPIN[i % 10]}" "$R" "$lab" "$DIM" $((SECONDS - t0)) "$R"
-      else
-        printf '\r  %s%s%s %s %s(%ds)%s\033[K\n    %s↳ %s%s\033[K\033[A' \
-          "$CYN" "${SPIN[i % 10]}" "$R" "$lab" "$DIM" $((SECONDS - t0)) "$R" \
-          "$DIM" "$infotxt" "$R"
-      fi
+      printf '\r  %s%s%s %s %s(%ds)%s\033[K\n    %s↳ %s%s\033[K\033[A' \
+        "$CYN" "${SPIN[i % 10]}" "$R" "$lab" "$DIM" $((SECONDS - t0)) "$R" \
+        "$DIM" "${INFO:0:$((cols - 8))}" "$R"
       i=$((i + 1))
       sleep 0.1
     done
@@ -1263,7 +1233,7 @@ run_install() {
   CERT_OK=0
   if [ "$DNS_OK" -ne 0 ]; then warn "DNS не подтверждён — попытка выпуска может не удаться"; fi
   while true; do
-    if step_run -q "Выпуск сертификата Let's Encrypt для $DOMAIN (certbot)" lscript "$TMPD/cert.sh" "$DOMAIN" "$EMAIL"; then CERT_OK=1; break; fi
+    if step_run "certbot --webroot для $DOMAIN" lscript "$TMPD/cert.sh" "$DOMAIN" "$EMAIL"; then CERT_OK=1; break; fi
     warn "не удалось выпустить сертификат (DNS ещё не разошёлся? порт 80 недоступен?)"
     confirm "Повторить?" || break
   done
@@ -1281,7 +1251,7 @@ run_install() {
   save_conf
   step_run "nginx: сертификат, секретные пути, «живые» эндпоинты, автопродление (панель: $([ $HIDE_PANEL -eq 1 ] && echo скрыта || echo опубликована))" python3 "$TMPD/nginx-final.py" "$DOMAIN" "$xw" "$USER_PATH" "$TUNNEL_PATH" "$CHAIN_USER_PORT" "$CHAIN_TUNNEL_PORT" "$BACKEND_IP" "$HIDE_PANEL" "$VER_PATH" || die "не удалось включить финальный конфиг nginx"
   step_run "nginx: возврат освобождённой памяти системе (MALLOC_*), окно HTTP/2 1 МБ; перезапуск nginx" lscript "$TMPD/nginx-malloc.sh" || warn "ограничение памяти nginx не применено (см. лог)"
-  step_run "RELAY: адаптивный канал по памяти (zram, своп-файл, буфер Xray 128 КБ, регулятор буферов и памяти TCP)" lscript "$TMPD/mem-tune.sh" apply || warn "ограничения памяти применены не полностью (см. лог)"
+  step_run "RELAY: защита от нехватки памяти (zram-своп, потолок TCP-памяти, защита x-ui и Xray от OOM, автоперезапуск)" lscript "$TMPD/mem-tune.sh" apply || warn "ограничения памяти применены не полностью (см. лог)"
   /usr/local/bin/sync-sub-path >>"$LOG" 2>&1 || true
   step_run "3x-ui: журнал доступа и DNS-журнал Xray отключены" python3 "$TMPD/relay-harden.py" || warn "журналы Xray не отключены (см. лог)"
   step_run "Параметры отправки в инбаунде пользователей (POST 1,2–2 МБ, пауза 8–14 мс)" python3 "$TMPD/speed-tune.py" apply || warn "параметры отправки не заданы (см. лог)"
@@ -1294,7 +1264,7 @@ run_install() {
   section "BACKEND: мост Xray"
   step_run "Установка Xray $XRAY_VER (проверка SHA-256), запуск chain-bridge, инструменты обновления" backend_bridge || die "мост не запустился (journalctl -u chain-bridge на BACKEND)"
   step_run "Сторож моста (локальный, в сеть ничего не отправляет), keepalive HTTP/2, защита моста" rscript "$TMPD/watchdog-install.sh" || warn "сторож моста установлен не полностью (см. лог)"
-  step_run "BACKEND: адаптивный канал по памяти (zram, своп-файл, буфер Xray 128 КБ, регулятор буферов и памяти TCP)" rscript "$TMPD/mem-tune.sh" apply activate || warn "ограничения памяти на BACKEND применены не полностью (см. лог)"
+  step_run "BACKEND: защита от нехватки памяти (zram-своп, потолок TCP-памяти, защита x-ui и Xray от OOM, автоперезапуск)" rscript "$TMPD/mem-tune.sh" apply activate || warn "ограничения памяти на BACKEND применены не полностью (см. лог)"
   step_run "SSH-ключ RELAY для перезапуска моста (разрешена только эта команда)" setup_restart_key || warn "ключ для перезапуска моста не настроен (см. лог): RELAY не сможет сам перезапустить мост"
 
   # [11] проверка цепочки
@@ -1336,7 +1306,7 @@ run_install() {
 
   # [12] firewall BACKEND и итог
   section "BACKEND: firewall и итог"
-  step_run -q "ufw: SSH сохранён, все остальные входящие закрыты" rscript "$TMPD/ufw-backend.sh" || warn "firewall BACKEND не настроен (см. лог)"
+  step_run "ufw: SSH сохранён, все остальные входящие закрыты" rscript "$TMPD/ufw-backend.sh" || warn "firewall BACKEND не настроен (см. лог)"
   if [ $CHECK_FAIL -eq 1 ]; then write_marker "check-failed"; else write_marker "done"; fi
   ok "настройки сохранены: $CONF_FILE, метка установки: $MARKER_FILE"
 
@@ -1435,7 +1405,7 @@ run_component_update() {
   info "BACKEND: сторож запоминает версию Xray моста; при запуске скрипта RELAY спрашивает её по тому же ограниченному SSH-ключу (команда «версия»)"
   info "RELAY: chain-speedtest (скорость цепочки без вашего канала до RELAY); в инбаунде пользователей задаются параметры отправки (POST 1,2–2 МБ, пауза 8–14 мс), клиенты получают их с подпиской — при неудачной проверке всё возвращается"
   info "RELAY: nginx перезапустится с MALLOC_* (иначе память воркера раздувается до сотен МБ из-за фрагментации heap) и окном HTTP/2 1 МБ вместо 4 МБ: соединения оборвутся на несколько секунд"
-  info "RELAY и BACKEND: zram-своп, потолок TCP-памяти и размеров сокетных буферов, zram с потолком ОЗУ и своп-файл 4 ГБ, буфер Xray 128 КБ на соединение (вместо 512), «резиновый» регулятор: памяти много — буферы и память TCP растут (канал используется по максимуму), памяти мало — плавно сжимаются; Xray не останавливается; в инбаунде пользователей сервер буферизует не более 12 POST вне очереди вместо 30"
+  info "RELAY и BACKEND: zram-своп, потолок TCP-памяти и размеров сокетных буферов, защита x-ui, Xray и моста от OOM с автоперезапуском (лимиты и earlyoom версии 4.16 убираются); в инбаунде пользователей сервер буферизует не более 12 POST вне очереди вместо 30"
   info "пользователи, пути клиентов, подписка и сертификат не меняются; 3x-ui перезапустится один раз (потоки оборвутся на несколько секунд, мост переподключится сам)"
   confirm "Обновить компоненты?" || { echo "  Отменено."; return 0; }
   section "Подключение к BACKEND"
@@ -1446,15 +1416,15 @@ run_component_update() {
   step_run "Журнал сбоев на RELAY и BACKEND (записи «ИНФО»)" install_incident_log || die "журнал сбоев не обновлён (см. лог)"
   step_run "RELAY: chain-health (версия Xray, сверка с BACKEND)" lscript "$TMPD/health-relay.sh" "$VER_PATH" || die "RELAY не обновлён (см. лог)"
   step_run "RELAY: nginx — возврат освобождённой памяти системе (MALLOC_*), окно HTTP/2 1 МБ; перезапуск nginx" lscript "$TMPD/nginx-malloc.sh" || warn "ограничение памяти nginx не применено (см. лог)"
-  step_run "RELAY: адаптивный канал по памяти (zram, своп-файл, буфер Xray 128 КБ, регулятор буферов и памяти TCP)" lscript "$TMPD/mem-tune.sh" apply || warn "ограничения памяти применены не полностью (см. лог)"
+  step_run "RELAY: защита от нехватки памяти (zram-своп, потолок TCP-памяти, защита x-ui и Xray от OOM, автоперезапуск)" lscript "$TMPD/mem-tune.sh" apply || warn "ограничения памяти применены не полностью (см. лог)"
   step_run "RELAY: chain-speedtest (скорость цепочки без вашего канала до RELAY)" install -m 755 "$TMPD/speedtest.py" /usr/local/bin/chain-speedtest || warn "chain-speedtest не установлен"
   section "BACKEND"
   step_run "Инструменты моста (chain-update-bridge записывает версию Xray)" rscript "$TMPD/bridge-tools.sh" || die "инструменты моста не обновлены (см. лог)"
   step_run "Сторож моста (запоминает версию Xray) и команда «версия» для RELAY" rscript "$TMPD/watchdog-install.sh" || die "BACKEND не обновлён (см. лог)"
-  step_run "BACKEND: адаптивный канал по памяти (zram, своп-файл, буфер Xray 128 КБ, регулятор буферов и памяти TCP); мост перезапустится" rscript "$TMPD/mem-tune.sh" apply activate || warn "ограничения памяти на BACKEND применены не полностью (см. лог)"
+  step_run "BACKEND: защита от нехватки памяти (zram-своп, потолок TCP-памяти, защита x-ui и Xray от OOM, автоперезапуск); мост перезапустится" rscript "$TMPD/mem-tune.sh" apply activate || warn "ограничения памяти на BACKEND применены не полностью (см. лог)"
   section "Скорость отправки"
   step_run "Параметры отправки в инбаунде пользователей: применение и проверка (при неудаче откат)" apply_speed_tuning || warn "параметры отправки не применены (подробности в логе); остальное обновлено"
-  step_run "RELAY: применение параметров памяти (перезапуск x-ui, если нужно), очистка дискового свопа" lscript "$TMPD/mem-tune.sh" activate || warn "лимиты памяти не активированы (см. лог)"
+  step_run "RELAY: снятие лимитов версии 4.16 (перезапуск x-ui, если они ещё действуют), очистка дискового свопа" lscript "$TMPD/mem-tune.sh" activate || warn "лимиты памяти не активированы (см. лог)"
   section "Метка установки"
   step_run "Версии Xray и версия компонентов записаны в метку на RELAY и BACKEND" component_markers || warn "метка обновлена не полностью"
   echo

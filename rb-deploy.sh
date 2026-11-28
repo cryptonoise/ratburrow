@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # RatBurrow: служебные скрипты RELAY и BACKEND (make_scripts: создаются в $TMPD).
 # Часть основного скрипта: подключается из ratburrow.sh (source) и отдельно не запускается.
-RB_PART_VERSION="4.22"
+RB_PART_VERSION="4.23"
 if [ "${BASH_SOURCE[0]}" = "$0" ]; then echo "Это часть RatBurrow, запускайте ratburrow.sh"; exit 1; fi
 
 # ───────────────────────── скрипты установки (создаются в $TMPD) ─────────────────────────
@@ -199,8 +199,6 @@ if [ -f "$F" ]; then
   sed -i 's/^http2_body_preread_size .*/http2_body_preread_size 1m;/; s/, 4m около 65 МБ\/с (замер на стенде)/, 1m около 16 МБ\/с (4m расходовали память nginx)/' "$F"
   # оборванные клиентами соединения закрываются сразу, без ожидания FIN: буферы освобождаются быстрее
   grep -q '^reset_timedout_connection' "$F" || echo 'reset_timedout_connection on;' >> "$F"
-  grep -q '^grpc_buffer_size' "$F" || echo 'grpc_buffer_size 64k;' >> "$F"
-  grep -q '^http2_chunk_size' "$F" || echo 'http2_chunk_size 64k;' >> "$F"
 fi
 nginx -t
 systemctl restart nginx
@@ -231,11 +229,6 @@ cat > /usr/local/sbin/chain-memory <<'EOT'
 #   apply     записать настройки: sysctl, zram/своп, защита служб от OOM, снятие лимитов 4.16 (службы не перезапускаются)
 #   activate  перезапустить x-ui / chain-bridge, если в запущенном процессе остались лимиты прежних версий (GOMEMLIMIT); очистить дисковый своп
 #   diag      собрать данные о памяти (для разбора, кто её занимает)
-# Слои защиты: 1) меньше памяти на соединение в Xray (bufferSize); 2) zram с потолком ОЗУ и большой дисковый своп-запас;
-# (на ОЗУ до 1,5 ГБ zram не используется, только дисковый своп);
-# 3) ядро раньше начинает освобождать память; 4) chain-memguard — «резиновый» регулятор: по запасу памяти и давлению (PSI) каждые 2 с выбирает уровень
-# (free / normal / tight / crit) и на лету меняет буферы и память TCP: памяти много — канал используется по максимуму, памяти мало — окна плавно сжимаются.
-# Разрыв тяжёлых соединений — только в крайнем случае; Xray не останавливается
 #   remove    убрать всё, что поставил apply
 #   status    показать текущее состояние
 exec </dev/null
@@ -248,105 +241,6 @@ MEM_MB=$(awk '/^MemTotal:/ { printf "%d", $2 / 1024 }' /proc/meminfo)
 
 unit_exists() { systemctl cat "$1.service" >/dev/null 2>&1; }
 zram_active() { swapon --show=NAME --noheadings 2>/dev/null | grep -q '^/dev/zram'; }
-
-# своп: zram (быстрый, но с потолком ОЗУ: видео и шифрованный трафик не сжимаются и хранились бы как есть) + дисковый файл-запас
-# на ОЗУ до 1,5 ГБ zram не используется: трафик (видео, TLS) почти не сжимается (замер: 276 МБ данных заняли 236 МБ ОЗУ), потолок в 25% ОЗУ быстро
-# заполняется, и ядро тратит ОЗУ на хранение несжимаемых страниц. Своп только на диске (NVMe), swappiness низкий.
-drop_zram() {
-  local disk_mb d data_mb avail_mb
-  systemctl disable chain-zram.service >/dev/null 2>&1 || true
-  zram_active || return 0
-  disk_mb=$(swapon --show=NAME,SIZE --noheadings --bytes 2>/dev/null | awk '$1 !~ /^\/dev\/zram/ { s += $2 } END { printf "%d", s / 1048576 }')
-  if [ "${disk_mb:-0}" -lt 1024 ]; then echo "своп: zram оставлен (дискового свопа меньше 1 ГБ)"; zram_limit; return 0; fi
-  data_mb=$(zramctl --noheadings --bytes --output DATA 2>/dev/null | awk '{ s += $1 } END { printf "%d", s / 1048576 }')
-  avail_mb=$(awk '/^MemAvailable:/ { print int($2 / 1024) }' /proc/meminfo)
-  if [ "$avail_mb" -gt $(( ${data_mb:-0} / 3 + 80 )) ]; then
-    for d in $(swapon --show=NAME --noheadings 2>/dev/null | grep '^/dev/zram'); do
-      timeout 300 swapoff "$d" 2>/dev/null && zramctl --reset "$d" 2>/dev/null
-    done
-  fi
-  if zram_active; then
-    echo "своп: zram отключён для следующей загрузки; сейчас занято ${data_mb:-?} МБ данных и памяти для их выгрузки не хватает — перезагрузите сервер (reboot), и займёт ОЗУ ~240 МБ меньше"
-  else
-    echo "своп: zram отключён, ОЗУ освобождена"
-  fi
-}
-
-# лишние службы на малой ОЗУ: multipathd (≈ 25 МБ) нужен только для SAN/multipath-дисков
-trim_services() {
-  [ "$MEM_MB" -le 1536 ] || return 0
-  if systemctl is-active --quiet multipathd.service 2>/dev/null && [ -z "$(multipath -ll 2>/dev/null)" ]; then
-    systemctl disable --now multipathd.service multipathd.socket >/dev/null 2>&1 || true
-    : > /var/lib/chain-memory.multipathd
-    echo "multipathd: отключён (multipath-устройств нет), освобождено ~25 МБ"
-  fi
-}
-
-setup_swap() {
-  if [ "$MEM_MB" -le 1536 ]; then
-    make_swapfile
-    drop_zram
-    return 0
-  fi
-  if ! zram_active && modprobe zram 2>/dev/null && command -v zramctl >/dev/null 2>&1; then
-    write_zram_files
-    systemctl daemon-reload
-    systemctl enable chain-zram.service >/dev/null 2>&1 || true
-    systemctl restart chain-zram.service >/dev/null 2>&1 || true
-  elif [ -f /etc/systemd/system/chain-zram.service ]; then
-    write_zram_files; systemctl daemon-reload   # обновить скрипт для следующей загрузки
-  fi
-  if zram_active; then zram_limit; echo "своп: zram включён"; else echo "своп: zram недоступен в этом ядре"; fi
-  make_swapfile
-}
-
-write_zram_files() {
-  cat > /usr/local/sbin/chain-zram <<'EOZ'
-#!/bin/bash
-# zram-своп: размер равен ОЗУ (не более 2 ГБ), потолок занимаемой ОЗУ — 25%; сверх потолка страницы уходят в дисковый своп
-case "${1:-start}" in
-  start)
-    modprobe zram || exit 1
-    mb=$(awk '/^MemTotal:/ { m = int($2 / 1024); if (m > 2048) m = 2048; print m }' /proc/meminfo)
-    lim=$(awk '/^MemTotal:/ { print int($2 / 4096) }' /proc/meminfo)
-    dev=""
-    for alg in zstd lz4 lzo-rle ""; do
-      if [ -n "$alg" ]; then dev=$(zramctl --find --size "${mb}M" --algorithm "$alg" 2>/dev/null) || dev=""
-      else dev=$(zramctl --find --size "${mb}M" 2>/dev/null) || dev=""; fi
-      [ -n "$dev" ] && break
-    done
-    [ -n "$dev" ] || exit 1
-    echo "${lim}M" > "/sys/block/${dev#/dev/}/mem_limit" 2>/dev/null || true
-    mkswap "$dev" >/dev/null && swapon -p 100 "$dev"
-    ;;
-  stop)
-    for d in $(swapon --show=NAME --noheadings 2>/dev/null | grep '^/dev/zram'); do swapoff "$d" && zramctl --reset "$d"; done
-    ;;
-esac
-EOZ
-  chmod 755 /usr/local/sbin/chain-zram
-  cat > /etc/systemd/system/chain-zram.service <<'EOZ'
-[Unit]
-Description=zram swap (chain-memory)
-
-[Service]
-Type=oneshot
-RemainAfterExit=yes
-ExecStart=/usr/local/sbin/chain-zram start
-ExecStop=/usr/local/sbin/chain-zram stop
-
-[Install]
-WantedBy=multi-user.target
-EOZ
-}
-
-zram_limit() {  # потолок ОЗУ для уже работающего zram (применяется сразу, без перезагрузки)
-  local z lim=$(( MEM_MB * 25 / 100 ))
-  for z in /sys/block/zram*; do
-    [ -w "$z/mem_limit" ] || continue
-    echo "${lim}M" > "$z/mem_limit" 2>/dev/null && echo "zram: потолок ОЗУ ${lim} МБ ($(basename "$z"))"
-  done
-}
 
 make_swapfile() {  # запас на диске с приоритетом ниже zram: 4 ГБ при ≥ 7 ГБ свободного места, 2 ГБ при ≥ 5 ГБ
   local avail gb
@@ -366,331 +260,104 @@ make_swapfile() {  # запас на диске с приоритетом ниж
   echo "своп-файл: $SWAPFILE ${gb} ГБ"
 }
 
-# Xray: размер внутреннего буфера на соединение (по умолчанию 512 КБ в каждую сторону при 1300+ соединениях — сотни МБ) → 128 КБ (меньше — режет скорость одной загрузки).
-# Значение хранится в шаблоне 3x-ui (policy.levels.0.bufferSize); действует после перезапуска x-ui
-xray_buffer() {
-  local db=/etc/x-ui/x-ui.db
-  [ -f "$db" ] && command -v python3 >/dev/null 2>&1 || return 0
-  python3 - "$db" <<'EOQ'
-import json, os, shutil, sqlite3, sys, time
-db, prev = sys.argv[1], "/var/lib/chain-memory.prev"
-con = sqlite3.connect(db, timeout=30)
-row = con.execute("select value from settings where key='xrayTemplateConfig'").fetchone()
-if not row or not row[0]:
-    print("шаблон Xray не задан: bufferSize не меняется"); sys.exit(0)
-tpl = json.loads(row[0])
-lv = tpl.setdefault("policy", {}).setdefault("levels", {}).setdefault("0", {})
-cur = lv.get("bufferSize")
-ours = os.path.exists(prev)
-if cur is not None and (int(cur) == 128 or (int(cur) < 128 and not ours)):
-    print("Xray: bufferSize уже %s КБ" % cur); sys.exit(0)
-shutil.copy2(db, "%s.bak-buf-%s" % (db, time.strftime("%Y%m%d-%H%M%S")))
-if not ours:
-    json.dump({"bufferSize": cur}, open(prev, "w"))
-lv["bufferSize"] = 128
-con.execute("update settings set value=? where key='xrayTemplateConfig'", (json.dumps(tpl, ensure_ascii=False),))
-con.commit()
-open("/var/lib/chain-memory.restart", "w").close()
-print("Xray: bufferSize 128 КБ на соединение (было %s), нужен перезапуск x-ui" % ("512 по умолчанию" if cur is None else cur))
-EOQ
+# на ОЗУ до 1,5 ГБ zram не используется: трафик (видео, TLS) почти не сжимается (замер: 276 МБ данных заняли 236 МБ ОЗУ), zram забивает ОЗУ
+# несжимаемыми страницами и своп «заполняется» (панель: память 93%, подкачка 91%). Своп только на диске (NVMe), swappiness низкий.
+drop_zram() {
+  local disk_mb d data_mb avail_mb
+  systemctl disable chain-zram.service >/dev/null 2>&1 || true
+  zram_active || return 0
+  disk_mb=$(swapon --show=NAME,SIZE --noheadings --bytes 2>/dev/null | awk '$1 !~ /^\/dev\/zram/ { s += $2 } END { printf "%d", s / 1048576 }')
+  if [ "${disk_mb:-0}" -lt 1024 ]; then echo "своп: zram оставлен (дискового свопа меньше 1 ГБ)"; return 0; fi
+  data_mb=$(zramctl --noheadings --bytes --output DATA 2>/dev/null | awk '{ s += $1 } END { printf "%d", s / 1048576 }')
+  avail_mb=$(awk '/^MemAvailable:/ { print int($2 / 1024) }' /proc/meminfo)
+  if [ "$avail_mb" -gt $(( ${data_mb:-0} / 3 + 80 )) ]; then
+    for d in $(swapon --show=NAME --noheadings 2>/dev/null | grep '^/dev/zram'); do
+      timeout 300 swapoff "$d" 2>/dev/null && zramctl --reset "$d" 2>/dev/null
+    done
+  fi
+  if zram_active; then
+    echo "своп: zram отключён для следующей загрузки; сейчас в нём ${data_mb:-?} МБ данных и памяти для выгрузки не хватает — перезагрузите сервер (reboot), и ОЗУ освободится"
+  else
+    echo "своп: zram отключён, ОЗУ освобождена"
+  fi
 }
 
-xray_buffer_revert() {
-  local db=/etc/x-ui/x-ui.db
-  [ -f "$db" ] && [ -f /var/lib/chain-memory.prev ] && command -v python3 >/dev/null 2>&1 || return 0
-  python3 - "$db" <<'EOQ'
-import json, os, sqlite3, sys
-db, prev = sys.argv[1], "/var/lib/chain-memory.prev"
-old = json.load(open(prev)).get("bufferSize")
-con = sqlite3.connect(db, timeout=30)
-row = con.execute("select value from settings where key='xrayTemplateConfig'").fetchone()
-if row and row[0]:
-    tpl = json.loads(row[0])
-    lv = tpl.setdefault("policy", {}).setdefault("levels", {}).setdefault("0", {})
-    if old is None: lv.pop("bufferSize", None)
-    else: lv["bufferSize"] = old
-    con.execute("update settings set value=? where key='xrayTemplateConfig'", (json.dumps(tpl, ensure_ascii=False),))
-    con.commit()
-os.remove(prev)
-EOQ
+# лишние службы на малой ОЗУ: multipathd (≈ 25 МБ) нужен только для SAN/multipath-дисков
+trim_services() {
+  [ "$MEM_MB" -le 1536 ] || return 0
+  if systemctl is-active --quiet multipathd.service 2>/dev/null && [ -z "$(multipath -ll 2>/dev/null)" ]; then
+    systemctl disable --now multipathd.service multipathd.socket >/dev/null 2>&1 || true
+    : > /var/lib/chain-memory.multipathd
+    echo "multipathd: отключён (multipath-устройств нет), освобождено ~25 МБ"
+  fi
 }
 
-# сторож давления памяти (chain-memguard)
-install_guard() {
-  command -v python3 >/dev/null 2>&1 || { echo "chain-memguard: нет python3, пропущено"; return 0; }
-  cat > /usr/local/sbin/chain-memguard <<'EOP'
-#!/usr/bin/env python3
-# chain-memguard: «резиновый» регулятор канала по запасу памяти. Каждые 2 с выбирает уровень и применяет его на лету (без перезапусков):
-#   free      памяти много: буферы и память TCP максимальные, канал используется полностью
-#   normal    обычный режим
-#   tight     запас памяти уменьшается: буферы и память TCP сжимаются, ядро плавно уменьшает окна приёма и отправители замедляются
-#   crit      критично: то же ещё сильнее
-# Бюджет памяти TCP делится между активными потоками (много параллельных загрузок — окно каждой меньше, но все идут); tcp_mem не опускается ниже текущего расхода
-# Соединения не рвутся и новые принимаются всегда (в 4.22 убраны отказ в новых соединениях и разрыв тяжёлых: они давали NS_ERROR_NET_RESET в браузере). Процессы не убиваются.
-# Вверх (строже) уровень меняется быстро, вниз (свободнее) только после стабильного спада давления.
-import ctypes, os, re, shlex, shutil, signal, subprocess, sys, time
-
-TAG = "chain-memguard"
-PORT = "443"
-STATE = "/run/chain-memguard.state"
-INTERVAL = 1.0
-NAMES = ("free", "normal", "tight", "crit")
-
-
-def rd(path):
-    try:
-        with open(path) as f:
-            return f.read()
-    except OSError:
-        return ""
-
-
-def wr(path, val):
-    try:
-        with open("/proc/sys/" + path, "w") as f:
-            f.write(val)
-    except OSError:
-        pass
-
-
-def meminfo():
-    d = {}
-    for line in rd("/proc/meminfo").splitlines():
-        k, _, v = line.partition(":")
-        try:
-            d[k] = int(v.split()[0])
-        except (ValueError, IndexError):
-            pass
-    return d
-
-
-def psi():
-    some = full = 0.0
-    for line in rd("/proc/pressure/memory").splitlines():
-        m = re.match(r"(some|full) avg10=([0-9.]+)", line)
-        if m:
-            if m.group(1) == "some":
-                some = float(m.group(2))
-            else:
-                full = float(m.group(2))
-    return some, full
-
-
-def swapio():
-    n = 0
-    for line in rd("/proc/vmstat").splitlines():
-        if line.startswith(("pswpin ", "pswpout ")):
-            n += int(line.split()[1])
-    return n
-
-
-def run(args):
-    try:
-        return subprocess.run(args, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, timeout=20)
-    except Exception:
-        return subprocess.CompletedProcess(args, 1, "", "")
-
-
-def log(title, desc="", incident=False):
-    print("%s %s" % (title, desc), flush=True)
-    if incident and os.path.exists("/usr/local/bin/chain-incident"):
-        run(["/usr/local/bin/chain-incident", "память", title, desc or title])
-
-
-# ---------- уровни ----------
-def table(mem_mb):
-    if mem_mb <= 1536:
-        mb = (16, 8, 4, 2)           # МБ на сокет (потолок автонастройки буфера)
-    elif mem_mb <= 3072:
-        mb = (24, 12, 6, 3)
-    else:
-        mb = (32, 16, 8, 4)
-    pct = ((16, 24, 35), (12, 18, 26), (8, 12, 18), (6, 9, 12))   # tcp_mem: нижний / давление / предел, % ОЗУ
-    lowat = (262144, 131072, 65536, 32768)                       # сколько неотправленных данных держит сокет
-    return mb, pct, lowat
-
-
-def tcp_pages():
-    for line in rd("/proc/net/sockstat").splitlines():
-        if line.startswith("TCP:"):
-            m = re.search(r"\bmem (\d+)", line)
-            if m:
-                return int(m.group(1))
+# своп: на ОЗУ до 1,5 ГБ — только файл на диске; больше — zram (сжатая подкачка в ОЗУ); если ядро без zram и подкачки нет совсем — файл 1 ГБ
+setup_swap() {
+  local total avail
+  if [ "$MEM_MB" -le 1536 ]; then
+    make_swapfile
+    drop_zram
     return 0
-
-
-def tcp_limits(idx, mem_mb):
-    pages = mem_mb * 256
-    pct = table(mem_mb)[1][idx]
-    return [pages * p // 100 for p in pct]
-
-
-def apply_level(idx, mem_mb, active=0, cur=0):
-    # active — число «тяжёлых» потоков: общий бюджет памяти TCP делится между ними (чем больше загрузок, тем меньше окно каждой)
-    mb, pct, lowat = table(mem_mb)
-    top = mb[idx] * 1048576
-    pages = mem_mb * 256
-    lim = tcp_limits(idx, mem_mb)
-    b = top
-    if active > 1:
-        b = max(min(top, int(lim[1] * 4096 * 0.8 / active)), 1048576)
-    # tcp_mem никогда не опускаем ниже текущего расхода: иначе ядро сразу режет окна и гоняет пакеты в отказ, а загрузка обрывается по таймауту
-    floor = int(cur * 1.3)
-    lim = [max(lim[0], floor), max(lim[1], int(floor * 1.15)), max(lim[2], int(floor * 1.3))]
-    lim = [min(lim[0], pages * 40 // 100), min(lim[1], pages * 45 // 100), min(lim[2], pages * 50 // 100)]
-    wr("net/core/rmem_max", str(b))
-    wr("net/core/wmem_max", str(b))
-    wr("net/ipv4/tcp_rmem", "4096 131072 %d" % b)
-    wr("net/ipv4/tcp_wmem", "4096 65536 %d" % b)
-    wr("net/ipv4/tcp_mem", "%d %d %d" % tuple(lim))
-    wr("net/ipv4/tcp_notsent_lowat", str(lowat[idx]))
-    return b
-
-
-def classify(avail, some, rate, sfree, tcpf):
-    # tcpf — расход памяти TCP в долях от «давления» (tcp_mem[1]) текущего уровня
-    if some > 40 or avail < 4 or rate > 6000 or (sfree < 8 and (some > 10 or avail < 8)):
-        return 3
-    if some > 15 or avail < 12 or rate > 1500 or tcpf > 1.0:
-        return 2
-    if some < 3 and avail > 35 and rate < 200 and tcpf < 0.4:
-        return 0
-    if tcpf > 0.6 or some > 6 or avail < 20:
-        return 1
-    return 1
-
-
-# ---------- приём новых соединений ----------
-def tables():
-    return [t for t in ("iptables", "ip6tables") if shutil.which(t)]
-
-
-def release():
-    for t in tables():
-        for line in run([t, "-w", "-S", "INPUT"]).stdout.splitlines():
-            if TAG in line and line.startswith("-A INPUT"):
-                run([t, "-w", "-D", "INPUT"] + shlex.split(line)[2:])
-
-
-def heavy_count():
-    # потоки, у которых в очередях накоплено > 64 КБ: это и есть активные загрузки
-    n = 0
-    for line in run(["ss", "-tnH", "state", "established", "sport", "=", ":" + PORT]).stdout.splitlines():
-        f = line.split()
-        if f and not f[0].isdigit():
-            f = f[1:]
-        if len(f) < 2:
-            continue
-        try:
-            if int(f[0]) + int(f[1]) >= 65536:
-                n += 1
-        except ValueError:
-            pass
-    return n
-
-
-def main():
-    mem_mb = max(meminfo().get("MemTotal", 1048576) // 1024, 256)
-    if "--release" in sys.argv:
-        release()
-        apply_level(1, mem_mb)   # при остановке регулятора возвращается обычный режим
-        return
-    try:
-        ctypes.CDLL(None, use_errno=True).mlockall(3)   # сам регулятор не должен уходить в своп
-    except Exception:
-        pass
-
-    def stop(*a):
-        release()
-        apply_level(1, mem_mb)
-        sys.exit(0)
-    signal.signal(signal.SIGTERM, stop)
-    release()
-    level, up, down = 1, 0, 0
-    apply_level(level, mem_mb, 0, tcp_pages())
-    active, last_act, cur_buf = 0, 0.0, 0
-    last_io, last_t = swapio(), time.time()
-    while True:
-        time.sleep(INTERVAL)
-        try:
-            now = time.time()
-            mi = meminfo()
-            tot = max(mi.get("MemTotal", 1), 1)
-            avail = mi.get("MemAvailable", 0) * 100.0 / tot
-            st = mi.get("SwapTotal", 0)
-            sfree = mi.get("SwapFree", 0) * 100.0 / st if st else 100.0
-            some, full = psi()
-            io = swapio()
-            rate = (io - last_io) / max(now - last_t, 0.1)
-            last_io, last_t = io, now
-
-            tp = tcp_pages()
-            tcpf = tp / max(tcp_limits(level, mem_mb)[1], 1)
-            want = classify(avail, some, rate, sfree, tcpf)
-            old = level
-            if want > level:
-                up, down = up + 1, 0
-                if up >= (1 if want == 3 else 3):
-                    level, up = want, 0
-            elif want < level:
-                down, up = down + 1, 0
-                if down >= {3: 10, 2: 16, 1: 30}[level]:
-                    level, down = level - 1, 0
-            else:
-                up = down = 0
-            # число тяжёлых потоков считаем только когда память TCP заметна (иначе ss зря грузит процессор)
-            n_act = active
-            if tcpf > 0.25 and now - last_act >= 2:
-                n_act, last_act = heavy_count(), now
-            elif tcpf <= 0.25:
-                n_act = 0
-            if level != old or n_act != active:
-                active = n_act
-                cur_buf = apply_level(level, mem_mb, active, tp)
-            if level != old:
-                log("уровень канала: %s → %s" % (NAMES[old], NAMES[level]),
-                    "доступно %.0f%%, PSI some %.1f full %.1f, обмен со свопом %.0f стр/с, свободно свопа %.0f%%" % (avail, some, full, rate, sfree),
-                    incident=level >= 2 and old < 2)
-
-            with open(STATE, "w") as f:
-                f.write("уровень %s, доступно %.0f%%, PSI some %.1f full %.1f, своп-обмен %.0f стр/с, TCP %.0f МБ, тяжёлых потоков %d\n"
-                        % (NAMES[level], avail, some, full, rate, tp * 4 / 1024.0, active))
-        except Exception as e:
-            print("ошибка цикла: %s" % e, flush=True)
-
-
-if __name__ == "__main__":
-    main()
-EOP
-  chmod 755 /usr/local/sbin/chain-memguard
-  cat > /etc/systemd/system/chain-memguard.service <<'EOD2'
+  fi
+  if ! zram_active && modprobe zram 2>/dev/null && command -v zramctl >/dev/null 2>&1; then
+    cat > /usr/local/sbin/chain-zram <<'EOZ'
+#!/bin/bash
+# zram-своп: размер — половина ОЗУ (не более 2 ГБ); данные сжимаются, реально занимают в 2–3 раза меньше
+case "${1:-start}" in
+  start)
+    modprobe zram || exit 1
+    mb=$(awk '/^MemTotal:/ { m = int($2 / 2048); if (m > 2048) m = 2048; print m }' /proc/meminfo)
+    dev=""
+    for alg in zstd lz4 lzo-rle ""; do
+      if [ -n "$alg" ]; then dev=$(zramctl --find --size "${mb}M" --algorithm "$alg" 2>/dev/null) || dev=""
+      else dev=$(zramctl --find --size "${mb}M" 2>/dev/null) || dev=""; fi
+      [ -n "$dev" ] && break
+    done
+    [ -n "$dev" ] || exit 1
+    mkswap "$dev" >/dev/null && swapon -p 100 "$dev"
+    ;;
+  stop)
+    for d in $(swapon --show=NAME --noheadings 2>/dev/null | grep '^/dev/zram'); do swapoff "$d" && zramctl --reset "$d"; done
+    ;;
+esac
+EOZ
+    chmod 755 /usr/local/sbin/chain-zram
+    cat > /etc/systemd/system/chain-zram.service <<'EOZ'
 [Unit]
-Description=chain-memguard: адаптивный регулятор канала по запасу памяти
+Description=zram swap (chain-memory)
 
 [Service]
-ExecStart=/usr/bin/python3 /usr/local/sbin/chain-memguard
-ExecStopPost=/usr/local/sbin/chain-memguard --release
-Restart=always
-RestartSec=3
-OOMScoreAdjust=-900
-Nice=-10
-LimitMEMLOCK=infinity
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/chain-zram start
+ExecStop=/usr/local/sbin/chain-zram stop
 
 [Install]
 WantedBy=multi-user.target
-EOD2
-  systemctl daemon-reload
-  systemctl enable chain-memguard.service >/dev/null 2>&1 || true
-  systemctl restart chain-memguard.service >/dev/null 2>&1 || true
-  sleep 1
-  systemctl is-active --quiet chain-memguard && echo "chain-memguard: работает" || echo "chain-memguard: не запустился"
+EOZ
+    systemctl daemon-reload
+    systemctl enable chain-zram.service >/dev/null 2>&1 || true
+    systemctl restart chain-zram.service >/dev/null 2>&1 || true
+  fi
+  if zram_active; then echo "своп: zram включён"; return 0; fi
+  total=$(awk '/^SwapTotal:/ { print int($2 / 1024) }' /proc/meminfo)
+  if [ "${total:-0}" -ge 256 ]; then echo "своп: уже есть (${total} МБ), zram недоступен"; return 0; fi
+  avail=$(df -Pm / | awk 'NR == 2 { print $4 }')
+  if [ "${avail:-0}" -ge 4096 ] && [ ! -e "$SWAPFILE" ]; then
+    { fallocate -l 1G "$SWAPFILE" 2>/dev/null || dd if=/dev/zero of="$SWAPFILE" bs=1M count=1024 status=none; } \
+      && chmod 600 "$SWAPFILE" && mkswap "$SWAPFILE" >/dev/null && swapon -p 10 "$SWAPFILE" \
+      && { grep -q "^$SWAPFILE " /etc/fstab || echo "$SWAPFILE none swap sw,pri=10 0 0" >> /etc/fstab; echo "своп: файл $SWAPFILE 1 ГБ"; } \
+      || { swapoff "$SWAPFILE" 2>/dev/null; rm -f "$SWAPFILE"; echo "своп: создать не удалось (контейнер без поддержки подкачки?)"; }
+  else
+    echo "своп: не создан (мало места на диске или файл уже есть)"
+  fi
 }
 
 # sysctl: потолок памяти TCP и размеры буферов по объёму ОЗУ. Файл 99-zz грузится после 99-relay-network-tuning.conf и переопределяет его
 write_sysctl() {
   local buf pages sw=30
-  # статическая база = уровень normal регулятора chain-memguard (он меняет эти значения на лету и при остановке возвращает их)
-  if   [ "$MEM_MB" -le 1536 ]; then buf=12582912
+  if   [ "$MEM_MB" -le 1536 ]; then buf=8388608     # 8 МБ: при 60 мс RTT хватает на ~1 Гбит/с на соединение
   elif [ "$MEM_MB" -le 3072 ]; then buf=16777216
   else buf=33554432; fi
   pages=$(( MEM_MB * 256 ))
@@ -701,11 +368,9 @@ write_sysctl() {
     echo "net.core.wmem_max=$buf"
     echo "net.ipv4.tcp_rmem=4096 131072 $buf"
     echo "net.ipv4.tcp_wmem=4096 65536 $buf"
-    echo "net.ipv4.tcp_mem=$(( pages * 12 / 100 )) $(( pages * 18 / 100 )) $(( pages * 26 / 100 ))"
+    [ "$MEM_MB" -le 3072 ] && echo "net.ipv4.tcp_mem=$(( pages * 10 / 100 )) $(( pages * 15 / 100 )) $(( pages * 22 / 100 ))"
     echo "net.ipv4.tcp_notsent_lowat=131072"
     echo "vm.swappiness=$sw"
-    echo "vm.watermark_scale_factor=100"   # kswapd начинает освобождать память раньше: меньше остановок в прямой очистке
-    echo "vm.watermark_boost_factor=0"
     [ "$MEM_MB" -gt 1536 ] && zram_active && echo "vm.page-cluster=0"
     [ "$MEM_MB" -le 3072 ] && echo "vm.min_free_kbytes=32768"
   } > "$CONF"
@@ -781,10 +446,10 @@ do_activate() {
   for u in $UNITS; do
     unit_exists "$u" && [ -f "/etc/systemd/system/$u.service.d/chain-memory.conf" ] || continue
     systemctl is-active --quiet "$u" || continue
-    if [ "$u" = x-ui ] && [ -f /var/lib/chain-memory.restart ]; then rm -f /var/lib/chain-memory.restart; else stale_limit "$u" || continue; fi
+    stale_limit "$u" || continue
     systemctl restart "$u"
     for i in $(seq 1 20); do systemctl is-active --quiet "$u" && break; sleep 2; done
-    systemctl is-active --quiet "$u" && echo "перезапущен: $u (новые параметры памяти применены)" || echo "ВНИМАНИЕ: $u не запустился после перезапуска" >&2
+    systemctl is-active --quiet "$u" && echo "перезапущен: $u (старые лимиты памяти сняты)" || echo "ВНИМАНИЕ: $u не запустился после перезапуска" >&2
   done
   reclaim_swap
 }
@@ -796,10 +461,6 @@ do_remove() {
     rmdir "/etc/systemd/system/$u.service.d" 2>/dev/null || true
   done
   if [ -f /var/lib/chain-memory.multipathd ]; then systemctl enable --now multipathd.socket multipathd.service >/dev/null 2>&1 || true; rm -f /var/lib/chain-memory.multipathd; fi
-  systemctl disable --now chain-memguard.service >/dev/null 2>&1 || true
-  [ -x /usr/local/sbin/chain-memguard ] && /usr/local/sbin/chain-memguard --release
-  rm -f /etc/systemd/system/chain-memguard.service /usr/local/sbin/chain-memguard /run/chain-memguard.state /var/lib/chain-memory.restart
-  xray_buffer_revert
   rm -f "$CONF" /etc/systemd/system/earlyoom.service.d/chain.conf
   rmdir /etc/systemd/system/earlyoom.service.d 2>/dev/null || true
   systemctl disable --now chain-zram.service >/dev/null 2>&1 || true
@@ -828,9 +489,6 @@ do_diag() {
   echo "== cgroup x-ui"; for f in memory.current memory.max memory.high memory.events; do echo "$f: $(tr '\n' ' ' < /sys/fs/cgroup/system.slice/x-ui.service/$f 2>/dev/null)"; done
   echo "== своп / zram"; swapon --show; zramctl 2>/dev/null
   echo "== память сокетов TCP (страницы по 4 КБ)"; grep -E '^(TCP|sockets)' /proc/net/sockstat; sysctl net.ipv4.tcp_mem
-  echo "== регулятор"; cat /run/chain-memguard.state 2>/dev/null; journalctl -u chain-memguard -n 8 --no-pager -o cat 2>/dev/null
-  echo "== чем ограничена скорость соединений на 443 (rwnd_limited — окно приёма, sndbuf_limited — буфер отправки, cwnd_limited — окно перегрузки)"
-  ss -tiHn state established '( sport = :443 )' 2>/dev/null | tr '\n' ' ' | sed 's/ESTAB/\nESTAB/g' | grep -aE 'rwnd_limited|sndbuf_limited|cwnd_limited' | sed -E 's/.*(rwnd_limited:[^ ]*|sndbuf_limited:[^ ]*|cwnd_limited:[^ ]*).*/&/' | cut -c1-230 | head -6
   echo "== ядро: slab (топ)"; slabtop -o -s c 2>/dev/null | sed -n '1,12p'
   echo "== ядро: нехватка памяти, убитые процессы, TCP out of memory"; dmesg -T 2>/dev/null | grep -iE 'out of memory|oom-kill|killed process|tcp: out of memory' | tail -15
   echo "== x-ui: журнал"; journalctl -u x-ui -n 25 --no-pager -o cat 2>/dev/null
@@ -845,14 +503,13 @@ do_status() {
   for u in $UNITS; do
     unit_exists "$u" && echo "$u: $(stale_limit "$u" && echo "работает со старым GOMEMLIMIT (нужно: chain-memory activate)" || echo "ок")"
   done
-  echo "сторож: $(systemctl is-active chain-memguard 2>/dev/null); $(cat /run/chain-memguard.state 2>/dev/null)"
   echo "cgroup x-ui: $(cat /sys/fs/cgroup/system.slice/x-ui.service/memory.current 2>/dev/null) байт, max=$(cat /sys/fs/cgroup/system.slice/x-ui.service/memory.max 2>/dev/null)"
 }
 
 [ "$#" -gt 0 ] || set -- status
 for a in "$@"; do
   case "$a" in
-    apply)    setup_swap; trim_services; write_sysctl; write_limits; remove_earlyoom; xray_buffer; install_guard ;;
+    apply)    setup_swap; trim_services; write_sysctl; write_limits; remove_earlyoom ;;
     activate) do_activate ;;
     remove)   do_remove ;;
     status)   do_status ;;
@@ -1324,9 +981,6 @@ open("/etc/nginx/conf.d/chain-limit.conf", "w").write(
     "limit_req_zone $binary_remote_addr zone=chain_site:10m rate=10r/s;\nlimit_req_status 429;\n"
     "# окно приёма HTTP/2 на поток (по умолчанию 64k): скорость одного потока ≈ окно / RTT: при 60 мс 64k даёт около 1 МБ/с, 1m около 16 МБ/с (4m расходовали память nginx: фрагментация heap)\n"
     "http2_body_preread_size 1m;\n"
-    "# направление «сервер → клиент»: буфер чтения ответа Xray и размер кусков DATA (по умолчанию 4–8k: много системных вызовов, ниже скорость и выше нагрузка на ЦП)\n"
-    "grpc_buffer_size 64k;\n"
-    "http2_chunk_size 64k;\n"
     "keepalive_requests 100000;\n")
 if not os.path.exists("/etc/nginx/chain-backend.conf"):
     open("/etc/nginx/chain-backend.conf", "w").write(
