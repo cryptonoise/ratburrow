@@ -1,24 +1,42 @@
 #!/usr/bin/env bash
-# relay-test.sh — диагностика задержек, потерь пакетов и состояния сети. Запускается на КЛИЕНТЕ.
+# relay-test.sh — диагностика задержек, потерь пакетов и состояния сети. Запускается на КЛИЕНТЕ (macOS или Linux).
 #
-# Что делает: спрашивает IP relay и (если нужно) IP backend, затем с клиента меряет пинг и потери
+# Что делает: спрашивает IP relay (обязательно) и IP backend (если нужен), затем с клиента меряет пинг и потери
 # до своего шлюза, контрольных адресов (Cloudflare, Google, Яндекс), relay и backend, строит маршруты (mtr),
 # проверяет MTU пути, время TCP/TLS-соединений и сравнивает счётчики сетевой карты и TCP до/после теста.
 # Каждая команда показана в отчёте вместе с выводом. Отчёт выводится только в консоль, файл не создаётся.
 #
 # Запуск:  curl -fsSL https://raw.githubusercontent.com/cryptonoise/ratburrow/refs/heads/main/relay-test.sh | sudo bash
+#
+# Совместимость: скрипт работает в bash 3.2 (стандартный bash на macOS), поэтому без ассоциативных массивов.
 
-RT_VERSION="2.0"
-set -u
+RT_VERSION="2.1"
 set -o pipefail
-export LC_ALL=C.UTF-8   # одинаковая работа с кириллицей и десятичной точкой независимо от локали
+
+# ───────────────────────── система ─────────────────────────
+OS=$(uname -s); IS_MAC=0; [ "$OS" = "Darwin" ] && IS_MAC=1
+IS_ROOT=0; [ "$(id -u)" -eq 0 ] && IS_ROOT=1
+if [ $IS_MAC -eq 1 ]; then
+  export PATH="$PATH:/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/usr/local/sbin"   # сюда Homebrew ставит mtr
+fi
+# одинаковая работа с кириллицей и десятичной точкой независимо от локали
+if locale -a 2>/dev/null | grep -qix 'C.UTF-8'; then export LC_ALL=C.UTF-8
+elif locale -a 2>/dev/null | grep -qi '^en_US.utf-\?8$'; then export LC_ALL=en_US.UTF-8
+else export LC_ALL=C; fi
 
 # ───────────────────────── настройки ─────────────────────────
-RELAY_IP=""             # IP или имя RELAY (вводится после запуска)
+RELAY_IP=""             # IP или имя RELAY (вводится после запуска, обязательно)
 BACKEND_IP=""           # IP или имя BACKEND (вводится после запуска, необязательно)
-COUNT=100               # сколько ICMP-пакетов слать на каждую цель (каждые 0.2 с)
+COUNT=100               # сколько ICMP-пакетов слать на каждую цель
 MTR_COUNT=150           # сколько циклов mtr на каждую цель
-AUTO_INSTALL=1          # ставить недостающие пакеты (apt-get)
+AUTO_INSTALL=1          # ставить недостающие пакеты (apt-get на Linux, brew на macOS)
+PING_I=0.2              # интервал между пакетами, с
+
+if [ $IS_MAC -eq 1 ]; then PING_W=2000; PING_DF="-D"; else PING_W=2; PING_DF="-M do"; fi   # -W: на macOS в мс, на Linux в секундах
+if [ $IS_MAC -eq 1 ] && [ $IS_ROOT -eq 0 ]; then PING_I=1; COUNT=30; fi                     # macOS: интервал меньше 1 с только от root
+
+TMO=""; have_t() { command -v "$1" >/dev/null 2>&1; }
+have_t timeout && TMO="timeout"; have_t gtimeout && TMO="gtimeout"                          # на macOS timeout есть только в coreutils
 
 # ───────────────────────── оформление ─────────────────────────
 if [ -t 1 ]; then
@@ -39,7 +57,7 @@ grad_text() {
 
 TMPD=$(mktemp -d /tmp/relay-test.XXXXXX) || { echo "не удалось создать временный каталог"; exit 1; }
 
-cleanup() { jobs -p 2>/dev/null | xargs -r kill 2>/dev/null; rm -rf "$TMPD"; [ -t 1 ] && printf '\033[?25h'; return 0; }
+cleanup() { local p; for p in $(jobs -p 2>/dev/null); do kill "$p" 2>/dev/null; done; rm -rf "$TMPD"; [ -t 1 ] && printf '\033[?25h'; return 0; }
 trap cleanup EXIT
 trap 'echo; echo "прервано"; exit 130' INT TERM
 
@@ -89,13 +107,17 @@ run() {
 
 # ───────────────────────── ввод адресов ─────────────────────────
 # ввод идёт с терминала (/dev/tty), поэтому работает и при запуске через «curl ... | sudo bash»
-ask_host() {   # ask_host "что спрашиваем" ИМЯ_ПЕРЕМЕННОЙ — пустой ответ = пропустить
-  local q="$1" var="$2" a
+ask_host() {   # ask_host "что спрашиваем" ИМЯ_ПЕРЕМЕННОЙ ОБЯЗАТЕЛЬНО(1/0)
+  local q="$1" var="$2" req="${3:-0}" a hint
+  if [ "$req" = "1" ]; then hint="обязательно"; else hint="Enter — пропустить"; fi
   while true; do
-    printf '  %s%s%s %s(Enter — пропустить)%s: ' "$B" "$q" "$R" "$D" "$R"
-    IFS= read -r a </dev/tty || a=""
+    printf '  %s%s%s %s(%s)%s: ' "$B" "$q" "$R" "$D" "$hint" "$R"
+    IFS= read -r a </dev/tty || { echo; echo "ввод прерван"; exit 1; }
     a="${a//[[:space:]]/}"
-    if [ -z "$a" ]; then printf -v "$var" '%s' ""; return 0; fi
+    if [ -z "$a" ]; then
+      if [ "$req" = "1" ]; then echo "  ${YLW}▲${R} этот адрес обязателен, введите IP или имя хоста"; continue; fi
+      printf -v "$var" '%s' ""; return 0
+    fi
     if [[ "$a" =~ ^[A-Za-z0-9][A-Za-z0-9.-]*$ ]]; then printf -v "$var" '%s' "$a"; return 0; fi
     echo "  ${RED}недопустимый адрес${R}, введите IP или имя хоста ещё раз"
   done
@@ -109,7 +131,7 @@ fgt()    { awk -v a="$1" -v b="$2" 'BEGIN { exit !(a + 0 >= b + 0) }'; }   # a >
 P_NAME=(); P_ADDR=(); P_LOSS=(); P_MIN=(); P_AVG=(); P_MAX=(); P_MDEV=()
 ping_target() {   # ping_target имя адрес
   local name="$1" ip="$2" loss mn av mx md line
-  run "Пинг: $name ($ip), $COUNT пакетов с интервалом 0.2 с" "ping -n -c $COUNT -i 0.2 -W 2 -q $ip"
+  run "Пинг: $name ($ip), $COUNT пакетов с интервалом $PING_I с" "ping -n -c $COUNT -i $PING_I -W $PING_W -q $ip"
   loss=$(grep -oE '[0-9.]+% packet loss' "$RT_OUT" | grep -oE '^[0-9.]+')
   line=$(sed -n 's/.*= \([0-9.]*\)\/\([0-9.]*\)\/\([0-9.]*\)\/\([0-9.]*\) ms.*/\1 \2 \3 \4/p' "$RT_OUT" | head -n1)
   read -r mn av mx md <<<"$line"
@@ -146,23 +168,40 @@ mtr_analyze() {   # статус|потери_на_цели|хоп|адрес_х
 M_NAME=(); M_RES=()
 mtr_target() {   # mtr_target имя адрес
   local name="$1" ip="$2" args="-c 30" res
-  [ "$(id -u)" -eq 0 ] && args="-i 0.2 -c $MTR_COUNT"
-  run "Маршрут (mtr): $name ($ip)" "timeout 240 mtr -rwn $args $ip" "mtr -rwn $args $ip"
+  [ $IS_ROOT -eq 1 ] && args="-i 0.2 -c $MTR_COUNT"
+  run "Маршрут (mtr): $name ($ip)" "${TMO:+$TMO 240 }mtr -rwn $args $ip" "mtr -rwn $args $ip"
   res=$(mtr_analyze "$RT_OUT")
   M_NAME+=("$name"); M_RES+=("$res")
 }
 
 # ───────────────────────── счётчики до/после ─────────────────────────
-declare -A C0=() C1=()
+# значения лежат в переменных C0_<имя> («до») и C1_<имя> («после»)
+num0()   { if [[ "${1:-}" =~ ^[0-9]+$ ]]; then echo "$1"; else echo 0; fi; }
+setv()   { printf -v "$1" '%s' "$(num0 "${2:-}")"; }
 snmp_val() { awk -v p="$1:" -v k="$2" '$1 == p { if (!h) { for (i = 2; i <= NF; i++) c[$i] = i; h = 1 } else { print $(c[k]); exit } }' /proc/net/snmp; }
-snap() {   # snap ИМЯ_МАССИВА: снимок счётчиков интерфейса и TCP/UDP
-  local -n S=$1; local f
-  for f in rx_packets rx_errors rx_dropped rx_fifo_errors tx_packets tx_errors tx_dropped; do S[$f]=$(cat "/sys/class/net/$DEV/statistics/$f" 2>/dev/null || echo 0); done
-  S[tcp_out]=$(snmp_val Tcp OutSegs); S[tcp_retr]=$(snmp_val Tcp RetransSegs); S[tcp_in]=$(snmp_val Tcp InSegs); S[tcp_inerr]=$(snmp_val Tcp InErrs)
-  S[udp_inerr]=$(snmp_val Udp InErrors); S[udp_rcvbuf]=$(snmp_val Udp RcvbufErrors)
-  S[ip_disc]=$(snmp_val Ip InDiscards); S[ip_hdr]=$(snmp_val Ip InHdrErrors)
+snap() {   # snap ПРЕФИКС (C0 или C1): снимок счётчиков интерфейса и TCP/UDP
+  local p=$1 f tcp udp
+  if [ $IS_MAC -eq 1 ]; then
+    # netstat -I DEV -d -b: колонки считаем с конца строки (адрес в середине бывает пустым)
+    set -- $(netstat -I "$DEV" -d -b 2>/dev/null | awk '
+      NR == 1 { dc = ($NF == "Drop") ? 0 : 1; next }
+      $3 ~ /^<Link/ && !d { d = 1; print $(NF - 7 + dc), $(NF - 6 + dc), $(NF - 4 + dc), $(NF - 3 + dc), (dc ? 0 : $NF) }')
+    setv "${p}_rx_packets" "${1:-0}"; setv "${p}_rx_errors" "${2:-0}"; setv "${p}_rx_dropped" 0; setv "${p}_rx_fifo_errors" 0
+    setv "${p}_tx_packets" "${3:-0}"; setv "${p}_tx_errors" "${4:-0}"; setv "${p}_tx_dropped" "${5:-0}"
+    tcp=$(netstat -s -p tcp 2>/dev/null); udp=$(netstat -s -p udp 2>/dev/null)
+    setv "${p}_tcp_out"    "$(awk '$2 == "packets" && $3 == "sent" { print $1; exit }' <<<"$tcp")"
+    setv "${p}_tcp_retr"   "$(awk '$2 == "data" && $3 == "packets" && /retransmitted/ { print $1; exit }' <<<"$tcp")"
+    setv "${p}_udp_inerr"  "$(awk '/with bad checksum/ { print $1; exit }' <<<"$udp")"
+    setv "${p}_udp_rcvbuf" "$(awk '/dropped due to full socket buffers/ { print $1; exit }' <<<"$udp")"
+    setv "${p}_ip_disc" 0
+  else
+    for f in rx_packets rx_errors rx_dropped rx_fifo_errors tx_packets tx_errors tx_dropped; do setv "${p}_$f" "$(cat "/sys/class/net/$DEV/statistics/$f" 2>/dev/null)"; done
+    setv "${p}_tcp_out" "$(snmp_val Tcp OutSegs)"; setv "${p}_tcp_retr" "$(snmp_val Tcp RetransSegs)"
+    setv "${p}_udp_inerr" "$(snmp_val Udp InErrors)"; setv "${p}_udp_rcvbuf" "$(snmp_val Udp RcvbufErrors)"
+    setv "${p}_ip_disc" "$(snmp_val Ip InDiscards)"
+  fi
 }
-delta() { echo $(( ${C1[$1]:-0} - ${C0[$1]:-0} )); }
+delta() { local k1="C1_$1" k0="C0_$1"; echo $(( ${!k1:-0} - ${!k0:-0} )); }
 
 # ───────────────────────── функции для сбора сведений ─────────────────────────
 f_system() {
@@ -170,20 +209,40 @@ f_system() {
   echo "время (UTC): $(date -u '+%F %T')"
   echo "хост:        $(hostname)"
   echo "ядро:        $(uname -srm)"
-  (. /etc/os-release 2>/dev/null && echo "ОС:          ${PRETTY_NAME:-?}")
-  echo "аптайм:      $(uptime -p 2>/dev/null || uptime)"
-  echo "нагрузка:    $(cut -d' ' -f1-3 /proc/loadavg)"
-  v=$(systemd-detect-virt 2>/dev/null); echo "виртуализ.:  ${v:-н/д}"
-  echo "CPU:         $(nproc) ($(grep -m1 'model name' /proc/cpuinfo | cut -d: -f2- | sed 's/^ //'))"
-  free -m
+  if [ $IS_MAC -eq 1 ]; then
+    echo "ОС:          $(sw_vers -productName) $(sw_vers -productVersion)"
+    echo "аптайм:      $(uptime)"
+    echo "нагрузка:    $(sysctl -n vm.loadavg)"
+    echo "CPU:         $(sysctl -n hw.ncpu) ($(sysctl -n machdep.cpu.brand_string 2>/dev/null))"
+    echo "память:      $(( $(sysctl -n hw.memsize) / 1048576 )) МБ"
+  else
+    (. /etc/os-release 2>/dev/null && echo "ОС:          ${PRETTY_NAME:-?}")
+    echo "аптайм:      $(uptime -p 2>/dev/null || uptime)"
+    echo "нагрузка:    $(cut -d' ' -f1-3 /proc/loadavg)"
+    v=$(systemd-detect-virt 2>/dev/null); echo "виртуализ.:  ${v:-н/д}"
+    echo "CPU:         $(nproc) ($(grep -m1 'model name' /proc/cpuinfo | cut -d: -f2- | sed 's/^ //'))"
+    free -m
+  fi
 }
 f_ipinfo() { curl -4 -sS -m 10 https://ipinfo.io/json || curl -4 -sS -m 10 https://ifconfig.me; }
 f_netinfo() {
-  ip -br addr; echo; ip -4 route; echo
-  ip -d link show dev "$DEV" | sed -n 1,4p; echo
-  grep -vE '^[[:space:]]*(#|$)' /etc/resolv.conf
+  if [ $IS_MAC -eq 1 ]; then
+    ifconfig "$DEV" | head -n 12; echo
+    netstat -rn -f inet | head -n 20; echo
+    scutil --dns | grep -E 'nameserver\[|search domain' | head -n 10
+  else
+    ip -br addr; echo; ip -4 route; echo
+    ip -d link show dev "$DEV" | sed -n 1,4p; echo
+    grep -vE '^[[:space:]]*(#|$)' /etc/resolv.conf
+  fi
 }
 f_nic() {
+  if [ $IS_MAC -eq 1 ]; then
+    ifconfig "$DEV" | grep -E 'mtu|media|status|options'
+    if have wdutil && [ $IS_ROOT -eq 1 ]; then echo "— Wi-Fi (wdutil):"; wdutil info 2>/dev/null | grep -E 'SSID|RSSI|Noise|Tx Rate|Channel|PHY Mode' | head -n 10; fi
+    echo; sysctl net.inet.tcp.delayed_ack net.inet.tcp.sendspace net.inet.tcp.recvspace net.inet.tcp.mssdflt 2>&1
+    return 0
+  fi
   if have ethtool; then
     ethtool -i "$DEV" 2>&1
     ethtool "$DEV" 2>&1 | grep -E 'Speed|Duplex|Link detected'
@@ -195,12 +254,12 @@ f_nic() {
   echo; tc qdisc show dev "$DEV" 2>&1
   echo; sysctl net.ipv4.tcp_congestion_control net.core.default_qdisc net.ipv4.tcp_mtu_probing 2>&1
 }
-f_mtu() {   # f_mtu адрес: максимальный размер пакета без фрагментации (двоичный поиск по ping -M do)
+f_mtu() {   # f_mtu адрес: максимальный размер пакета без фрагментации (двоичный поиск по ping с флагом «не фрагментировать»)
   local ip="$1" lo=1200 hi=1472 mid
-  if ! ping -n -M do -c 2 -W 2 -s $lo "$ip" >/dev/null 2>&1; then echo "ICMP до $ip не проходит: проверить MTU нельзя"; return 0; fi
+  if ! ping -n $PING_DF -c 2 -W $PING_W -s $lo "$ip" >/dev/null 2>&1; then echo "ICMP до $ip не проходит: проверить MTU нельзя"; return 0; fi
   while [ $lo -lt $hi ]; do
     mid=$(((lo + hi + 1) / 2))
-    if ping -n -M do -c 2 -W 2 -s $mid "$ip" >/dev/null 2>&1; then lo=$mid; else hi=$((mid - 1)); fi
+    if ping -n $PING_DF -c 2 -W $PING_W -s $mid "$ip" >/dev/null 2>&1; then lo=$mid; else hi=$((mid - 1)); fi
   done
   echo "максимальный payload без фрагментации: $lo байт, MTU пути = $((lo + 28))"
 }
@@ -213,8 +272,6 @@ f_curl() {   # f_curl url: 5 запросов с разбивкой по эта�
 }
 
 # ───────────────────────── приветствие и ввод адресов ─────────────────────────
-IS_ROOT=0; [ "$(id -u)" -eq 0 ] && IS_ROOT=1
-
 echo
 printf '  '; grad_text "RELAY TEST"; printf '  %sv%s%s\n' "$D" "$RT_VERSION" "$R"
 echo "  ${D}задержки, потери и состояние сети: запуск на клиенте, отчёт в консоль${R}"
@@ -225,34 +282,54 @@ if ! { : </dev/tty; } 2>/dev/null; then
   exit 1
 fi
 
-ask_host "IP relay" RELAY_IP
-ask_host "IP backend, если нужен" BACKEND_IP
-if [ -z "$RELAY_IP" ] && [ -z "$BACKEND_IP" ]; then
-  echo "  ${YLW}▲${R} адреса не указаны: будут проверены только шлюз и контрольные адреса"
-fi
+ask_host "IP relay" RELAY_IP 1
+ask_host "IP backend, если нужен" BACKEND_IP 0
 echo
 
 # ───────────────────────── подготовка ─────────────────────────
-DEV=$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for (i = 1; i < NF; i++) if ($i == "dev") { print $(i + 1); exit }}')
-LOCAL_IP=$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for (i = 1; i < NF; i++) if ($i == "src") { print $(i + 1); exit }}')
-GW=$(ip -4 route show default 2>/dev/null | awk '{for (i = 1; i < NF; i++) if ($i == "via") { print $(i + 1); exit }}')
+if [ $IS_MAC -eq 1 ]; then
+  DEV=$(route -n get 1.1.1.1 2>/dev/null | awk '/interface:/ { print $2; exit }')
+  GW=$(route -n get default 2>/dev/null | awk '/gateway:/ { print $2; exit }')
+  LOCAL_IP=$([ -n "$DEV" ] && ifconfig "$DEV" 2>/dev/null | awk '$1 == "inet" { print $2; exit }')
+else
+  DEV=$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for (i = 1; i < NF; i++) if ($i == "dev") { print $(i + 1); exit }}')
+  LOCAL_IP=$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for (i = 1; i < NF; i++) if ($i == "src") { print $(i + 1); exit }}')
+  GW=$(ip -4 route show default 2>/dev/null | awk '{for (i = 1; i < NF; i++) if ($i == "via") { print $(i + 1); exit }}')
+fi
 if [ -z "$DEV" ]; then echo "не удалось определить сетевой интерфейс (нет маршрута по умолчанию?)"; exit 1; fi
 PUB_IP=$(curl -4 -s -m 8 https://ifconfig.me 2>/dev/null); num_ok "${PUB_IP//./}" || PUB_IP="${LOCAL_IP:-?}"
 
-[ $IS_ROOT -eq 1 ] || emit "  ${YLW}▲${R} запущено не от root: интервал пинга и mtr ограничены, установка пакетов недоступна"
+if [ $IS_ROOT -eq 0 ]; then
+  if [ $IS_MAC -eq 1 ]; then
+    emit "  ${YLW}▲${R} запущено не от root: на macOS пинг идёт с интервалом 1 с (30 пакетов), mtr недоступен. Запускайте через sudo"
+  else
+    emit "  ${YLW}▲${R} запущено не от root: интервал пинга и mtr ограничены, установка пакетов недоступна"
+  fi
+fi
 
 # недостающие пакеты
-miss=()
-have ping    || miss+=(iputils-ping)
-have ip      || miss+=(iproute2)
-have curl    || miss+=(curl)
-have mtr     || miss+=(mtr-tiny)
-have ethtool || miss+=(ethtool)
-if [ ${#miss[@]} -gt 0 ]; then
-  if [ $AUTO_INSTALL -eq 1 ] && [ $IS_ROOT -eq 1 ] && have apt-get; then
-    run "Установка недостающих пакетов: ${miss[*]}" "DEBIAN_FRONTEND=noninteractive apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq ${miss[*]}"
-  else
-    emit "  ${YLW}▲${R} не хватает: ${miss[*]} (соответствующие проверки будут пропущены)"
+if [ $IS_MAC -eq 1 ]; then
+  if ! have mtr && [ $AUTO_INSTALL -eq 1 ] && have brew; then
+    if [ $IS_ROOT -eq 1 ] && [ -n "${SUDO_USER:-}" ] && [ "$SUDO_USER" != "root" ]; then
+      run "Установка mtr через Homebrew" "sudo -u $SUDO_USER env HOMEBREW_NO_AUTO_UPDATE=1 HOMEBREW_NO_ENV_HINTS=1 $(command -v brew) install mtr"
+    elif [ $IS_ROOT -eq 0 ]; then
+      run "Установка mtr через Homebrew" "HOMEBREW_NO_AUTO_UPDATE=1 HOMEBREW_NO_ENV_HINTS=1 brew install mtr"
+    fi
+  fi
+  have mtr || emit "  ${YLW}▲${R} mtr не установлен: выполните «brew install mtr» и запускайте скрипт через sudo; раздел маршрутов будет пропущен"
+else
+  miss=()
+  have ping    || miss+=(iputils-ping)
+  have ip      || miss+=(iproute2)
+  have curl    || miss+=(curl)
+  have mtr     || miss+=(mtr-tiny)
+  have ethtool || miss+=(ethtool)
+  if [ ${#miss[@]} -gt 0 ]; then
+    if [ $AUTO_INSTALL -eq 1 ] && [ $IS_ROOT -eq 1 ] && have apt-get; then
+      run "Установка недостающих пакетов: ${miss[*]}" "DEBIAN_FRONTEND=noninteractive apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq ${miss[*]}"
+    else
+      emit "  ${YLW}▲${R} не хватает: ${miss[*]} (соответствующие проверки будут пропущены)"
+    fi
   fi
 fi
 have ping || { echo "ping не найден: продолжать нельзя"; exit 1; }
@@ -263,11 +340,18 @@ T_START=$SECONDS
 # ───────────────────────── 1. сведения о клиенте ─────────────────────────
 section "1. Клиент и сеть"
 emit "  публичный IP клиента: ${B}$PUB_IP${R}   интерфейс: $DEV   локальный IP: ${LOCAL_IP:-?}   шлюз: ${GW:-нет}"
-emit "  relay: ${B}${RELAY_IP:-не указан}${R}   backend: ${B}${BACKEND_IP:-не указан}${R}"
-run "Система, ядро, процессор, память" "f_system" "date; hostname; uname -srm; uptime; systemd-detect-virt; nproc; free -m"
-have curl && run "Публичный IP и провайдер (ASN, город)" "f_ipinfo" "curl -4 -sS https://ipinfo.io/json"
-run "Адреса, маршруты, MTU интерфейса, DNS-серверы" "f_netinfo" "ip -br addr; ip -4 route; ip -d link show dev $DEV; cat /etc/resolv.conf"
-run "Сетевая карта: драйвер, скорость, счётчики ошибок, очередь, TCP-настройки" "f_nic" "ethtool -i/-S $DEV; tc qdisc show dev $DEV; sysctl net.ipv4.tcp_congestion_control ..."
+emit "  relay: ${B}${RELAY_IP}${R}   backend: ${B}${BACKEND_IP:-не указан}${R}"
+if [ $IS_MAC -eq 1 ]; then
+  run "Система, ядро, процессор, память" "f_system" "date; hostname; uname -srm; sw_vers; uptime; sysctl hw.ncpu hw.memsize"
+  have curl && run "Публичный IP и провайдер (ASN, город)" "f_ipinfo" "curl -4 -sS https://ipinfo.io/json"
+  run "Адреса, маршруты, DNS-серверы" "f_netinfo" "ifconfig $DEV; netstat -rn -f inet; scutil --dns"
+  run "Сетевой интерфейс: параметры, Wi-Fi, TCP-настройки" "f_nic" "ifconfig $DEV; wdutil info; sysctl net.inet.tcp.* ..."
+else
+  run "Система, ядро, виртуализация, процессор, память" "f_system" "date; hostname; uname -srm; uptime; systemd-detect-virt; nproc; free -m"
+  have curl && run "Публичный IP и провайдер (ASN, город)" "f_ipinfo" "curl -4 -sS https://ipinfo.io/json"
+  run "Адреса, маршруты, MTU интерфейса, DNS-серверы" "f_netinfo" "ip -br addr; ip -4 route; ip -d link show dev $DEV; cat /etc/resolv.conf"
+  run "Сетевая карта: драйвер, скорость, счётчики ошибок, очередь, TCP-настройки" "f_nic" "ethtool -i/-S $DEV; tc qdisc show dev $DEV; sysctl net.ipv4.tcp_congestion_control ..."
+fi
 
 # ───────────────────────── 2. задержки и потери ICMP ─────────────────────────
 section "2. Задержки и потери (ICMP, ${COUNT} пакетов на цель)"
@@ -276,25 +360,25 @@ emit "  ${D}Важно: потери ICMP не всегда равны поте�
 ping_target "cloudflare" "1.1.1.1"
 ping_target "google" "8.8.8.8"
 ping_target "yandex" "77.88.8.8"
-[ -n "$RELAY_IP" ] && ping_target "relay" "$RELAY_IP"
+ping_target "relay" "$RELAY_IP"
 [ -n "$BACKEND_IP" ] && ping_target "backend" "$BACKEND_IP"
 
 # ───────────────────────── 3. MTU ─────────────────────────
 section "3. MTU пути"
 MTU_NAME=(); MTU_VAL=()
 mtu_target() {   # mtu_target имя адрес
-  run "MTU до $1 ($2)" "f_mtu $2" "ping -M do -s <размер> $2 (двоичный поиск)"
+  run "MTU до $1 ($2)" "f_mtu $2" "ping $PING_DF -s <размер> $2 (двоичный поиск)"
   MTU_NAME+=("$1"); MTU_VAL+=("$(sed -n 's/.*MTU пути = \([0-9]*\).*/\1/p' "$RT_OUT")")
 }
 mtu_target "cloudflare" "1.1.1.1"
-[ -n "$RELAY_IP" ] && mtu_target "relay" "$RELAY_IP"
+mtu_target "relay" "$RELAY_IP"
 [ -n "$BACKEND_IP" ] && mtu_target "backend" "$BACKEND_IP"
 
 # ───────────────────────── 4. маршруты ─────────────────────────
 section "4. Маршруты (mtr)"
 emit "  ${D}Хоп, на котором потери ≥2% не исчезают до самой цели, — место, куда направлять запрос в поддержку.${R}"
 if have mtr; then
-  [ -n "$RELAY_IP" ] && mtr_target "relay" "$RELAY_IP"
+  mtr_target "relay" "$RELAY_IP"
   [ -n "$BACKEND_IP" ] && mtr_target "backend" "$BACKEND_IP"
   mtr_target "cloudflare" "1.1.1.1"
   mtr_target "yandex" "77.88.8.8"
@@ -315,7 +399,11 @@ fi
 # ───────────────────────── 6. счётчики до/после ─────────────────────────
 section "6. Счётчики клиента за время теста ($((SECONDS - T_START)) с)"
 snap C1
-run "Статистика интерфейса $DEV (ошибки и потери в ядре)" "ip -s -s link show dev $DEV"
+if [ $IS_MAC -eq 1 ]; then
+  run "Статистика интерфейса $DEV (ошибки и потери)" "netstat -I $DEV -d -b"
+else
+  run "Статистика интерфейса $DEV (ошибки и потери в ядре)" "ip -s -s link show dev $DEV"
+fi
 D_RXE=$(delta rx_errors); D_RXD=$(delta rx_dropped); D_TXE=$(delta tx_errors); D_TXD=$(delta tx_dropped); D_FIFO=$(delta rx_fifo_errors)
 D_OUT=$(delta tcp_out); D_RETR=$(delta tcp_retr); D_UDPE=$(delta udp_inerr); D_UDPB=$(delta udp_rcvbuf); D_DISC=$(delta ip_disc)
 RETR_PCT=$(awk -v r="$D_RETR" -v o="$D_OUT" 'BEGIN { if (o > 0) printf "%.2f", r * 100 / o; else print "0.00" }')
@@ -390,7 +478,7 @@ done
 if [ "$((D_RXE + D_RXD + D_FIFO + D_TXE + D_TXD))" -gt 0 ]; then
   add "Счётчики интерфейса $DEV выросли: rx_errors=$D_RXE rx_dropped=$D_RXD rx_fifo=$D_FIFO tx_errors=$D_TXE tx_dropped=$D_TXD (потери на самом клиенте: драйвер, Wi-Fi или виртуальная карта)." \
       "Interface $DEV counters increased: rx_errors=$D_RXE rx_dropped=$D_RXD rx_fifo=$D_FIFO tx_errors=$D_TXE tx_dropped=$D_TXD (loss on the client itself: driver, Wi-Fi or virtual NIC)."
-elif [ -n "$D_OUT" ]; then
+else
   add "Счётчики интерфейса $DEV за время теста не росли: сам клиент пакеты не теряет, потери (если есть) происходят в сети." \
       "Interface $DEV error/drop counters did not grow during the test: the client itself is not dropping packets, so any loss happens in the network."
 fi
@@ -405,7 +493,7 @@ done
 emit ""
 emit "${B}${CYN}━━ ИТОГ: relay-test.sh $RT_VERSION ━━${R}"
 emit "  клиент: ${B}${PUB_IP}${R} ($(hostname)), интерфейс $DEV, шлюз ${GW:-нет}"
-emit "  relay:  ${RELAY_IP:-не указан}   backend: ${BACKEND_IP:-не указан}"
+emit "  relay:  ${RELAY_IP}   backend: ${BACKEND_IP:-не указан}"
 emit "  время:  $(date -u '+%F %T') UTC, тест шёл $((SECONDS - T_START)) с"
 emit ""
 printf -v hdr '  %-11s %-18s %8s %8s %8s %8s %8s  %s' "target" "address" "loss%" "min" "avg" "max" "jitter" "verdict"   # заголовок на латинице: printf выравнивает по байтам
@@ -419,17 +507,16 @@ done
 emit "  ${D}время в мс; jitter — стандартное отклонение RTT; потери в процентах${R}"
 emit ""
 emit "${B}  Выводы${R}"
-if [ ${#FIND_RU[@]} -eq 0 ]; then emit "   • явных проблем в этом тесте не найдено"; fi
 for f in "${FIND_RU[@]}"; do emit "   • $f"; done
 emit ""
 emit "${B}  Текст для обращения в поддержку (хостинг relay или интернет-провайдер)${R}"
 emit "  ${D}— по-русски —${R}"
-emit "  Здравствуйте! С клиента (публичный IP ${PUB_IP}, интерфейс ${DEV}, шлюз ${GW:-?}) при работе с relay ${RELAY_IP:-?}${BACKEND_IP:+ и backend ${BACKEND_IP}} наблюдаются потери пакетов и просадки скорости."
+emit "  Здравствуйте! С клиента (публичный IP ${PUB_IP}, интерфейс ${DEV}, шлюз ${GW:-?}) при работе с relay ${RELAY_IP}${BACKEND_IP:+ и backend ${BACKEND_IP}} наблюдаются потери пакетов и просадки скорости."
 emit "  Автоматическая диагностика (relay-test.sh ${RT_VERSION}, $(date -u '+%F %T') UTC) показала:"
 for f in "${FIND_RU[@]}"; do emit "   - $f"; done
 emit "  Прошу проверить сеть на указанном участке, стык с апстримом, ограничения скорости и числа пакетов в секунду (pps). Полный вывод команд могу предоставить."
 emit "  ${D}— in English —${R}"
-emit "  Hello! From the client (public IP ${PUB_IP}, interface ${DEV}, gateway ${GW:-?}) we see packet loss and degraded throughput when working with relay ${RELAY_IP:-?}${BACKEND_IP:+ and backend ${BACKEND_IP}}."
+emit "  Hello! From the client (public IP ${PUB_IP}, interface ${DEV}, gateway ${GW:-?}) we see packet loss and degraded throughput when working with relay ${RELAY_IP}${BACKEND_IP:+ and backend ${BACKEND_IP}}."
 emit "  An automated diagnostic (relay-test.sh ${RT_VERSION}, $(date -u '+%F %T') UTC) shows:"
 for f in "${FIND_EN[@]}"; do emit "   - $f"; done
 emit "  Please check the network segment mentioned above, the upstream peering, and any rate / packets-per-second limits. The full command output is available on request."
