@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # RatBurrow: служебные скрипты RELAY и BACKEND (make_scripts: создаются в $TMPD).
 # Часть основного скрипта: подключается из ratburrow.sh (source) и отдельно не запускается.
-RB_PART_VERSION="4.15"
+RB_PART_VERSION="4.16"
 if [ "${BASH_SOURCE[0]}" = "$0" ]; then echo "Это часть RatBurrow, запускайте ratburrow.sh"; exit 1; fi
 
 # ───────────────────────── скрипты установки (создаются в $TMPD) ─────────────────────────
@@ -189,21 +189,269 @@ cat > "$DD/chain-malloc.conf" <<'EOT'
 Environment=MALLOC_MMAP_THRESHOLD_=131072
 Environment=MALLOC_TRIM_THRESHOLD_=131072
 Environment=MALLOC_ARENA_MAX=1
+OOMScoreAdjust=-300
 EOT
 systemctl daemon-reload
 F=/etc/nginx/conf.d/chain-limit.conf
 if [ -f "$F" ]; then
   sed -i 's/^http2_body_preread_size .*/http2_body_preread_size 1m;/; s/, 4m около 65 МБ\/с (замер на стенде)/, 1m около 16 МБ\/с (4m расходовали память nginx)/' "$F"
+  # оборванные клиентами соединения закрываются сразу, без ожидания FIN: буферы освобождаются быстрее
+  grep -q '^reset_timedout_connection' "$F" || echo 'reset_timedout_connection on;' >> "$F"
 fi
 nginx -t
 systemctl restart nginx
 sleep 2
 systemctl is-active --quiet nginx
+# Проверка по /proc/PID/environ здесь невозможна: nginx затирает свою область environ заголовком процесса («nginx: worker process»),
+# поэтому MALLOC_* там не видны, даже когда применены. Проверяем то, что задаёт systemd: переменные в окружении службы и отсутствие
+# непрочитанных изменений юнита (daemon-reload выполнен, nginx перезапущен после него).
+envs=$(systemctl show -p Environment --value nginx)
+for v in MALLOC_MMAP_THRESHOLD_=131072 MALLOC_TRIM_THRESHOLD_=131072 MALLOC_ARENA_MAX=1; do
+  printf '%s' "$envs" | grep -q -- "$v" || { echo "в окружении службы nginx нет $v" >&2; exit 1; }
+done
+[ "$(systemctl show -p NeedDaemonReload --value nginx)" = no ] || { echo "юнит nginx изменён после загрузки: нужен daemon-reload" >&2; exit 1; }
 m=$(systemctl show -p MainPID --value nginx)
-w=$(pgrep -P "$m" | head -n1)
-[ -n "$w" ] || { echo "рабочий процесс nginx не найден" >&2; exit 1; }
-tr '\0' '\n' < "/proc/$w/environ" | grep -q '^MALLOC_MMAP_THRESHOLD_=' || { echo "MALLOC_* не попали в процесс nginx" >&2; exit 1; }
-echo "nginx перезапущен, MALLOC_* применены; RSS worker: $(awk '/VmRSS/{print $2" kB"}' "/proc/$w/status")"
+rss=$(ps -o rss= --ppid "$m" 2>/dev/null | awk '{ s += $1 } END { print s + 0 }')
+echo "nginx перезапущен, MALLOC_* заданы в окружении службы (в /proc/PID/environ nginx их не показывает); RSS workers: ${rss} kB"
+EOF
+
+  # RELAY и BACKEND: ограничения памяти для VPS с 1 ГБ ОЗУ. Скрипт ставит инструмент /usr/local/sbin/chain-memory (apply | activate | remove | status)
+  # и вызывает его с переданными аргументами. Инструмент: сжатый своп в ОЗУ (zram) или файл подкачки, потолок TCP-памяти и размеров сокетных буферов,
+  # лимиты памяти для x-ui, Xray и моста (GOMEMLIMIT, MemoryHigh/MemoryMax), earlyoom (завершает самый тяжёлый процесс до того, как сервер «зависнет»).
+  cat > "$D/mem-tune.sh" <<'EOF'
+set -u
+install -d /usr/local/sbin
+cat > /usr/local/sbin/chain-memory <<'EOT'
+#!/bin/bash
+# chain-memory: ограничения памяти для VPS с малым ОЗУ (RELAY и BACKEND)
+#   apply     записать настройки: sysctl, zram/своп, лимиты служб, earlyoom (службы не перезапускаются)
+#   activate  перезапустить x-ui / chain-bridge, если лимиты ещё не действуют в запущенном процессе; вернуть страницы из дискового свопа в ОЗУ
+#   remove    убрать всё, что поставил apply
+#   status    показать текущее состояние
+exec </dev/null
+set -u
+CONF=/etc/sysctl.d/99-zz-chain-memory.conf
+SWAPFILE=/swapfile-chain
+EARLYOOM_MARK=/var/lib/chain-memory.earlyoom
+UNITS="x-ui chain-bridge"
+MEM_MB=$(awk '/^MemTotal:/ { printf "%d", $2 / 1024 }' /proc/meminfo)
+
+unit_exists() { systemctl cat "$1.service" >/dev/null 2>&1; }
+zram_active() { swapon --show=NAME --noheadings 2>/dev/null | grep -q '^/dev/zram'; }
+
+# своп: zram (сжатая подкачка в ОЗУ); если ядро без zram и подкачки нет совсем — файл 1 ГБ
+setup_swap() {
+  local total avail
+  if ! zram_active && modprobe zram 2>/dev/null && command -v zramctl >/dev/null 2>&1; then
+    cat > /usr/local/sbin/chain-zram <<'EOZ'
+#!/bin/bash
+# zram-своп: размер — половина ОЗУ (не более 2 ГБ); данные сжимаются, реально занимают в 2–3 раза меньше
+case "${1:-start}" in
+  start)
+    modprobe zram || exit 1
+    mb=$(awk '/^MemTotal:/ { m = int($2 / 2048); if (m > 2048) m = 2048; print m }' /proc/meminfo)
+    dev=""
+    for alg in zstd lz4 lzo-rle ""; do
+      if [ -n "$alg" ]; then dev=$(zramctl --find --size "${mb}M" --algorithm "$alg" 2>/dev/null) || dev=""
+      else dev=$(zramctl --find --size "${mb}M" 2>/dev/null) || dev=""; fi
+      [ -n "$dev" ] && break
+    done
+    [ -n "$dev" ] || exit 1
+    mkswap "$dev" >/dev/null && swapon -p 100 "$dev"
+    ;;
+  stop)
+    for d in $(swapon --show=NAME --noheadings 2>/dev/null | grep '^/dev/zram'); do swapoff "$d" && zramctl --reset "$d"; done
+    ;;
+esac
+EOZ
+    chmod 755 /usr/local/sbin/chain-zram
+    cat > /etc/systemd/system/chain-zram.service <<'EOZ'
+[Unit]
+Description=zram swap (chain-memory)
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/chain-zram start
+ExecStop=/usr/local/sbin/chain-zram stop
+
+[Install]
+WantedBy=multi-user.target
+EOZ
+    systemctl daemon-reload
+    systemctl enable chain-zram.service >/dev/null 2>&1 || true
+    systemctl restart chain-zram.service >/dev/null 2>&1 || true
+  fi
+  if zram_active; then echo "своп: zram включён"; return 0; fi
+  total=$(awk '/^SwapTotal:/ { print int($2 / 1024) }' /proc/meminfo)
+  if [ "${total:-0}" -ge 256 ]; then echo "своп: уже есть (${total} МБ), zram недоступен"; return 0; fi
+  avail=$(df -Pm / | awk 'NR == 2 { print $4 }')
+  if [ "${avail:-0}" -ge 4096 ] && [ ! -e "$SWAPFILE" ]; then
+    { fallocate -l 1G "$SWAPFILE" 2>/dev/null || dd if=/dev/zero of="$SWAPFILE" bs=1M count=1024 status=none; } \
+      && chmod 600 "$SWAPFILE" && mkswap "$SWAPFILE" >/dev/null && swapon -p 10 "$SWAPFILE" \
+      && { grep -q "^$SWAPFILE " /etc/fstab || echo "$SWAPFILE none swap sw,pri=10 0 0" >> /etc/fstab; echo "своп: файл $SWAPFILE 1 ГБ"; } \
+      || { swapoff "$SWAPFILE" 2>/dev/null; rm -f "$SWAPFILE"; echo "своп: создать не удалось (контейнер без поддержки подкачки?)"; }
+  else
+    echo "своп: не создан (мало места на диске или файл уже есть)"
+  fi
+}
+
+# sysctl: потолок памяти TCP и размеры буферов по объёму ОЗУ. Файл 99-zz грузится после 99-relay-network-tuning.conf и переопределяет его
+write_sysctl() {
+  local buf pages sw=30
+  if   [ "$MEM_MB" -le 1536 ]; then buf=8388608     # 8 МБ: при 60 мс RTT хватает на ~1 Гбит/с на соединение
+  elif [ "$MEM_MB" -le 3072 ]; then buf=16777216
+  else buf=33554432; fi
+  pages=$(( MEM_MB * 256 ))
+  zram_active && sw=100
+  {
+    echo "# chain-memory: ограничения памяти (ОЗУ ${MEM_MB} МБ)"
+    echo "net.core.rmem_max=$buf"
+    echo "net.core.wmem_max=$buf"
+    echo "net.ipv4.tcp_rmem=4096 131072 $buf"
+    echo "net.ipv4.tcp_wmem=4096 65536 $buf"
+    [ "$MEM_MB" -le 3072 ] && echo "net.ipv4.tcp_mem=$(( pages * 8 / 100 )) $(( pages * 12 / 100 )) $(( pages * 18 / 100 ))"
+    echo "net.ipv4.tcp_notsent_lowat=131072"
+    echo "vm.swappiness=$sw"
+    zram_active && echo "vm.page-cluster=0"
+    [ "$MEM_MB" -le 3072 ] && echo "vm.min_free_kbytes=32768"
+  } > "$CONF"
+  sysctl -q -p "$CONF" >/dev/null 2>&1 || sysctl --system >/dev/null 2>&1 || true
+}
+
+# лимиты служб: GOMEMLIMIT (мягкий потолок кучи Go: сборщик мусора работает чаще вместо роста памяти; x-ui передаёт его запускаемому Xray),
+# MemoryHigh (замедляет службу при превышении), MemoryMax (жёсткий потолок: служба перезапускается сама), OOMScoreAdjust (x-ui — первым при нехватке)
+write_limits() {
+  local gl high max u d
+  gl=$(( MEM_MB * 30 / 100 )); high=$(( MEM_MB * 55 / 100 )); max=$(( MEM_MB * 72 / 100 ))
+  for u in $UNITS; do
+    unit_exists "$u" || continue
+    d=/etc/systemd/system/$u.service.d
+    mkdir -p "$d"
+    cat > "$d/chain-memory.conf" <<EOD
+[Service]
+Environment=GOMEMLIMIT=${gl}MiB
+MemoryHigh=${high}M
+MemoryMax=${max}M
+OOMScoreAdjust=300
+EOD
+    echo "лимиты: $u (GOMEMLIMIT ${gl} МиБ, MemoryHigh ${high} МБ, MemoryMax ${max} МБ)"
+  done
+  systemctl daemon-reload
+}
+
+# earlyoom: при нехватке памяти и свопа завершает самый тяжёлый процесс (предпочтительно xray), не трогая sshd и nginx
+setup_earlyoom() {
+  local d=/etc/systemd/system/earlyoom.service.d eo
+  if ! command -v earlyoom >/dev/null 2>&1; then
+    DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=300 install -y earlyoom >/dev/null 2>&1 \
+      || { echo "earlyoom: пакет не установился, пропущено"; return 0; }
+    : > "$EARLYOOM_MARK"
+  fi
+  eo=$(command -v earlyoom) || return 0
+  mkdir -p "$d"
+  cat > "$d/chain.conf" <<EOD
+[Service]
+ExecStart=
+ExecStart=$eo -m 5 -s 10 -r 0 --avoid ^(sshd|nginx|systemd|systemd-journal)\$\$ --prefer ^xray
+EOD
+  systemctl daemon-reload
+  systemctl enable earlyoom >/dev/null 2>&1 || true
+  systemctl restart earlyoom >/dev/null 2>&1 || true
+  systemctl is-active --quiet earlyoom && echo "earlyoom: работает" || echo "earlyoom: не запустился"
+}
+
+has_limit() {  # GOMEMLIMIT есть в окружении запущенной службы?
+  local pid
+  pid=$(systemctl show -p MainPID --value "$1" 2>/dev/null)
+  [ -n "$pid" ] && [ "$pid" != 0 ] && tr '\0' '\n' < "/proc/$pid/environ" 2>/dev/null | grep -q '^GOMEMLIMIT='
+}
+
+# страницы из дискового свопа возвращаются в ОЗУ, только если памяти заведомо хватает (иначе swapoff сам вызвал бы нехватку памяти)
+reclaim_swap() {
+  local dev used_mb avail_mb
+  while read -r dev used_mb; do
+    [ -n "$dev" ] || continue
+    case "$dev" in /dev/zram*) continue ;; esac
+    [ "${used_mb:-0}" -ge 64 ] || continue
+    avail_mb=$(awk '/^MemAvailable:/ { print int($2 / 1024) }' /proc/meminfo)
+    if [ "$avail_mb" -gt $(( used_mb * 3 / 2 + 150 )) ]; then
+      if timeout 300 swapoff "$dev" 2>/dev/null; then
+        swapon -a 2>/dev/null || true
+        swapon --show=NAME --noheadings 2>/dev/null | grep -qx "$dev" || swapon "$dev" 2>/dev/null || true
+        echo "своп: $dev очищен (было занято ${used_mb} МБ)"
+      fi
+    else
+      echo "своп: $dev занят ${used_mb} МБ, свободной памяти мало — очистка пропущена"
+    fi
+  done < <(swapon --show=NAME,USED --bytes --noheadings 2>/dev/null | awk '{ printf "%s %d\n", $1, $2 / 1048576 }')
+}
+
+do_activate() {
+  local u i
+  for u in $UNITS; do
+    unit_exists "$u" && [ -f "/etc/systemd/system/$u.service.d/chain-memory.conf" ] || continue
+    systemctl is-active --quiet "$u" || continue
+    has_limit "$u" && continue
+    systemctl restart "$u"
+    for i in $(seq 1 20); do systemctl is-active --quiet "$u" && break; sleep 2; done
+    systemctl is-active --quiet "$u" && echo "перезапущен: $u (лимиты памяти применены)" || echo "ВНИМАНИЕ: $u не запустился после перезапуска" >&2
+  done
+  reclaim_swap
+}
+
+do_remove() {
+  local u
+  for u in $UNITS; do
+    rm -f "/etc/systemd/system/$u.service.d/chain-memory.conf"
+    rmdir "/etc/systemd/system/$u.service.d" 2>/dev/null || true
+  done
+  rm -f "$CONF" /etc/systemd/system/earlyoom.service.d/chain.conf
+  rmdir /etc/systemd/system/earlyoom.service.d 2>/dev/null || true
+  systemctl disable --now chain-zram.service >/dev/null 2>&1 || true
+  rm -f /etc/systemd/system/chain-zram.service /usr/local/sbin/chain-zram
+  if [ -e "$SWAPFILE" ]; then
+    swapoff "$SWAPFILE" 2>/dev/null || true
+    sed -i "\|^$SWAPFILE |d" /etc/fstab
+    rm -f "$SWAPFILE"
+  fi
+  if [ -f "$EARLYOOM_MARK" ]; then
+    systemctl disable --now earlyoom >/dev/null 2>&1 || true
+    DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=300 purge -y earlyoom >/dev/null 2>&1 || true
+    rm -f "$EARLYOOM_MARK"
+  else
+    systemctl restart earlyoom >/dev/null 2>&1 || true
+  fi
+  systemctl daemon-reload
+  sysctl --system >/dev/null 2>&1 || true
+  rm -f /usr/local/sbin/chain-memory
+  echo "ограничения памяти сняты (лимиты в уже запущенных службах исчезнут при их перезапуске)"
+}
+
+do_status() {
+  echo "ОЗУ: ${MEM_MB} МБ"; free -m | sed -n '1,3p'
+  echo "своп:"; swapon --show 2>/dev/null | sed 's/^/  /'
+  sysctl net.core.rmem_max net.ipv4.tcp_mem vm.swappiness 2>/dev/null | sed 's/^/  /'
+  local u
+  for u in $UNITS; do
+    unit_exists "$u" && echo "$u: $(has_limit "$u" && echo "GOMEMLIMIT действует" || echo "лимиты не действуют (нужен перезапуск: chain-memory activate)")"
+  done
+  systemctl is-active earlyoom 2>/dev/null | sed 's/^/earlyoom: /'
+}
+
+[ "$#" -gt 0 ] || set -- status
+for a in "$@"; do
+  case "$a" in
+    apply)    setup_swap; write_sysctl; write_limits; setup_earlyoom ;;
+    activate) do_activate ;;
+    remove)   do_remove ;;
+    status)   do_status ;;
+    *) echo "использование: chain-memory apply|activate|remove|status" >&2; exit 1 ;;
+  esac
+done
+EOT
+chmod 755 /usr/local/sbin/chain-memory
+exec /usr/local/sbin/chain-memory "$@"
 EOF
 
   cat > "$D/cert.sh" <<'EOF'
@@ -2330,7 +2578,7 @@ __CHAIN_EOF_SPEEDTEST_PY__
 # Параметры отправки XHTTP в инбаунде пользователей (порт 21443): размер POST и пауза между POST.
 # Они же попадают в ссылку подписки (extra), поэтому клиенты получают их при обновлении подписки; серверу значения нужны, чтобы принимать крупные POST
 # (сервер по умолчанию отвергает POST больше 1 МБ).
-#   apply   задать значения, если они не заданы или равны значениям Xray по умолчанию (1000000 и 30); прежние значения запоминаются
+#   apply   задать значения, если они не заданы или равны значениям Xray по умолчанию (1000000, 30 и 30); прежние значения запоминаются
 #   revert  вернуть запомненные прежние значения
 #   status  показать текущие значения
 # Значения — диапазоны, а не одно число: фиксированная пауза 30 мс — известная примета, случайный разброс её сглаживает.
@@ -2339,8 +2587,10 @@ import json, os, shutil, sqlite3, sys, time
 
 DB = os.environ.get("CHAIN_XUI_DB", "/etc/x-ui/x-ui.db")
 PREV = os.environ.get("CHAIN_SPEED_TUNE_PREV", "/var/lib/chain/speed-tune.prev")
-WANT = {"scMaxEachPostBytes": "1200000-2000000", "scMinPostsIntervalMs": "8-14"}
-DEFAULT = {"scMaxEachPostBytes": "1000000", "scMinPostsIntervalMs": "30"}
+# scMaxBufferedPosts (только сервер): сколько POST, пришедших вне очереди, сервер держит в памяти на сессию (по умолчанию 30 × до 2 МБ = до 60 МБ на сессию);
+# 12 хватает: при паузе 8–14 мс и RTT в десятки миллисекунд вне очереди приходят единицы POST
+WANT = {"scMaxEachPostBytes": "1200000-2000000", "scMinPostsIntervalMs": "8-14", "scMaxBufferedPosts": 12}
+DEFAULT = {"scMaxEachPostBytes": "1000000", "scMinPostsIntervalMs": "30", "scMaxBufferedPosts": 30}
 cmd = sys.argv[1] if len(sys.argv) > 1 else "status"
 if not os.path.exists(DB):
     print("база 3x-ui не найдена: %s" % DB); sys.exit(1)
@@ -2360,13 +2610,16 @@ elif cmd == "apply":
     prev, changed = {}, []
     for k, v in WANT.items():
         cur = xh.get(k)
-        if cur is None or str(cur) == DEFAULT[k]:
+        if cur is None or str(cur) == str(DEFAULT[k]):
             prev[k] = cur; xh[k] = v; changed.append(k)
     if not changed:
         print("unchanged"); sys.exit(0)
     shutil.copy2(DB, "%s.bak-speed-%s" % (DB, time.strftime("%Y%m%d-%H%M%S")))
     os.makedirs(os.path.dirname(PREV), exist_ok=True)
-    json.dump(prev, open(PREV, "w"))
+    old = json.load(open(PREV)) if os.path.exists(PREV) else {}
+    for k, v in prev.items():
+        old.setdefault(k, v)   # прежние значения из первого применения не затираются
+    json.dump(old, open(PREV, "w"))
     save()
     print("changed: " + ", ".join("%s=%s" % (k, WANT[k]) for k in changed))
 elif cmd == "revert":
@@ -2403,6 +2656,7 @@ EOF
 
   # BACKEND: откат моста
   cat > "$D/uninstall-backend.sh" <<'EOF'
+[ -x /usr/local/sbin/chain-memory ] && /usr/local/sbin/chain-memory remove >/dev/null 2>&1 || true
 systemctl disable --now chain-watchdog.timer chain-bridge chain-update-bridge.timer >/dev/null 2>&1 || true
 rm -f /etc/systemd/system/chain-watchdog.service /etc/systemd/system/chain-watchdog.timer /usr/local/bin/chain-watchdog
 rm -rf /var/lib/chain-bridge

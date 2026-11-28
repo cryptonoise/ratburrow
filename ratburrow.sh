@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-RB_VERSION="4.15"
+RB_VERSION="4.16"
 NAME="RatBurrow"
 
 set -u
@@ -1251,6 +1251,7 @@ run_install() {
   save_conf
   step_run "nginx: сертификат, секретные пути, «живые» эндпоинты, автопродление (панель: $([ $HIDE_PANEL -eq 1 ] && echo скрыта || echo опубликована))" python3 "$TMPD/nginx-final.py" "$DOMAIN" "$xw" "$USER_PATH" "$TUNNEL_PATH" "$CHAIN_USER_PORT" "$CHAIN_TUNNEL_PORT" "$BACKEND_IP" "$HIDE_PANEL" "$VER_PATH" || die "не удалось включить финальный конфиг nginx"
   step_run "nginx: возврат освобождённой памяти системе (MALLOC_*), окно HTTP/2 1 МБ; перезапуск nginx" lscript "$TMPD/nginx-malloc.sh" || warn "ограничение памяти nginx не применено (см. лог)"
+  step_run "RELAY: ограничения памяти (zram-своп, потолок TCP-памяти, GOMEMLIMIT для x-ui и Xray, earlyoom)" lscript "$TMPD/mem-tune.sh" apply || warn "ограничения памяти применены не полностью (см. лог)"
   /usr/local/bin/sync-sub-path >>"$LOG" 2>&1 || true
   step_run "3x-ui: журнал доступа и DNS-журнал Xray отключены" python3 "$TMPD/relay-harden.py" || warn "журналы Xray не отключены (см. лог)"
   step_run "Параметры отправки в инбаунде пользователей (POST 1,2–2 МБ, пауза 8–14 мс)" python3 "$TMPD/speed-tune.py" apply || warn "параметры отправки не заданы (см. лог)"
@@ -1263,6 +1264,7 @@ run_install() {
   section "BACKEND: мост Xray"
   step_run "Установка Xray $XRAY_VER (проверка SHA-256), запуск chain-bridge, инструменты обновления" backend_bridge || die "мост не запустился (journalctl -u chain-bridge на BACKEND)"
   step_run "Сторож моста (локальный, в сеть ничего не отправляет), keepalive HTTP/2, защита моста" rscript "$TMPD/watchdog-install.sh" || warn "сторож моста установлен не полностью (см. лог)"
+  step_run "BACKEND: ограничения памяти (zram-своп, потолок TCP-памяти, GOMEMLIMIT для x-ui и Xray, earlyoom)" rscript "$TMPD/mem-tune.sh" apply activate || warn "ограничения памяти на BACKEND применены не полностью (см. лог)"
   step_run "SSH-ключ RELAY для перезапуска моста (разрешена только эта команда)" setup_restart_key || warn "ключ для перезапуска моста не настроен (см. лог): RELAY не сможет сам перезапустить мост"
 
   # [11] проверка цепочки
@@ -1403,6 +1405,7 @@ run_component_update() {
   info "BACKEND: сторож запоминает версию Xray моста; при запуске скрипта RELAY спрашивает её по тому же ограниченному SSH-ключу (команда «версия»)"
   info "RELAY: chain-speedtest (скорость цепочки без вашего канала до RELAY); в инбаунде пользователей задаются параметры отправки (POST 1,2–2 МБ, пауза 8–14 мс), клиенты получают их с подпиской — при неудачной проверке всё возвращается"
   info "RELAY: nginx перезапустится с MALLOC_* (иначе память воркера раздувается до сотен МБ из-за фрагментации heap) и окном HTTP/2 1 МБ вместо 4 МБ: соединения оборвутся на несколько секунд"
+  info "RELAY и BACKEND: zram-своп, потолок TCP-памяти и размеров сокетных буферов, лимиты памяти для x-ui, Xray и моста, earlyoom; в инбаунде пользователей сервер буферизует не более 12 POST вне очереди вместо 30"
   info "пользователи, пути клиентов, подписка и сертификат не меняются; 3x-ui перезапустится один раз (потоки оборвутся на несколько секунд, мост переподключится сам)"
   confirm "Обновить компоненты?" || { echo "  Отменено."; return 0; }
   section "Подключение к BACKEND"
@@ -1413,12 +1416,15 @@ run_component_update() {
   step_run "Журнал сбоев на RELAY и BACKEND (записи «ИНФО»)" install_incident_log || die "журнал сбоев не обновлён (см. лог)"
   step_run "RELAY: chain-health (версия Xray, сверка с BACKEND)" lscript "$TMPD/health-relay.sh" "$VER_PATH" || die "RELAY не обновлён (см. лог)"
   step_run "RELAY: nginx — возврат освобождённой памяти системе (MALLOC_*), окно HTTP/2 1 МБ; перезапуск nginx" lscript "$TMPD/nginx-malloc.sh" || warn "ограничение памяти nginx не применено (см. лог)"
+  step_run "RELAY: ограничения памяти (zram-своп, потолок TCP-памяти, GOMEMLIMIT для x-ui и Xray, earlyoom)" lscript "$TMPD/mem-tune.sh" apply || warn "ограничения памяти применены не полностью (см. лог)"
   step_run "RELAY: chain-speedtest (скорость цепочки без вашего канала до RELAY)" install -m 755 "$TMPD/speedtest.py" /usr/local/bin/chain-speedtest || warn "chain-speedtest не установлен"
   section "BACKEND"
   step_run "Инструменты моста (chain-update-bridge записывает версию Xray)" rscript "$TMPD/bridge-tools.sh" || die "инструменты моста не обновлены (см. лог)"
   step_run "Сторож моста (запоминает версию Xray) и команда «версия» для RELAY" rscript "$TMPD/watchdog-install.sh" || die "BACKEND не обновлён (см. лог)"
+  step_run "BACKEND: ограничения памяти (zram-своп, потолок TCP-памяти, GOMEMLIMIT для x-ui и Xray, earlyoom); мост перезапустится" rscript "$TMPD/mem-tune.sh" apply activate || warn "ограничения памяти на BACKEND применены не полностью (см. лог)"
   section "Скорость отправки"
   step_run "Параметры отправки в инбаунде пользователей: применение и проверка (при неудаче откат)" apply_speed_tuning || warn "параметры отправки не применены (подробности в логе); остальное обновлено"
+  step_run "RELAY: лимиты памяти для x-ui и Xray (перезапуск x-ui, если лимиты ещё не действуют), очистка дискового свопа" lscript "$TMPD/mem-tune.sh" activate || warn "лимиты памяти не активированы (см. лог)"
   section "Метка установки"
   step_run "Версии Xray и версия компонентов записаны в метку на RELAY и BACKEND" component_markers || warn "метка обновлена не полностью"
   echo
@@ -1628,6 +1634,7 @@ backend_uninstall() {
 
 relay_uninstall() {  # relay_uninstall rm_xui rm_web
   local rm_xui="$1" rm_web="$2" d="${DOMAIN:-$(marker_get DOMAIN)}"
+  [ -x /usr/local/sbin/chain-memory ] && /usr/local/sbin/chain-memory remove >/dev/null 2>&1 || true
   systemctl disable --now chain-site-refresh.timer sync-sub-path.timer chain-xray-version.timer chain-xray-version.path chain-health.timer chain-certcheck.timer chain-boot-test.timer >/dev/null 2>&1 || true
   rm -rf /var/lib/chain /var/lib/chain-incident
   rm -f /etc/systemd/system/chain-certcheck.service /etc/systemd/system/chain-certcheck.timer /etc/systemd/system/chain-boot-test.service /etc/systemd/system/chain-boot-test.timer \
